@@ -60,15 +60,29 @@ for path in license_files:
     if not path.is_file() or not path.stat().st_size:
         raise SystemExit(f'Missing source license notices: {path}')
 
+def verify_native_cmake_settings(cache_text):
+    settings = {}
+    for line in cache_text.splitlines():
+        if not line or line.startswith(('#', '//')):
+            continue
+        declaration, separator, value = line.partition('=')
+        name, type_separator, cache_type = declaration.partition(':')
+        if separator and type_separator and cache_type:
+            settings[name] = value
+    # VR is a STRING option (AUTO/ON/OFF), while the other flags are BOOL.
+    # The configured value determines the build policy, not the cache type.
+    required = {'MOCKTAIL_ENABLE_VR': 'ON',
+                'MOCKTAIL_ENABLE_FSR3': 'OFF',
+                'MOCKTAIL_VR_DIAGNOSTICS': 'OFF'}
+    for name, expected in required.items():
+        if settings.get(name) != expected:
+            raise SystemExit(f'Unexpected build setting: {name}={settings.get(name)!r}; expected {expected}')
+
+
 cache = Path('/work/build-frame-arm64/CMakeCache.txt')
 build_policy = 'source-build-cache'
 if cache.exists():
-    settings = cache.read_text().splitlines()
-    for setting in ('MOCKTAIL_ENABLE_VR:BOOL=ON',
-                    'MOCKTAIL_ENABLE_FSR3:BOOL=OFF',
-                    'MOCKTAIL_VR_DIAGNOSTICS:BOOL=OFF'):
-        if setting not in settings:
-            raise SystemExit(f'Unexpected build setting: {setting}')
+    verify_native_cmake_settings(cache.read_text())
 else:
     # Source-audited release images may omit their disposable compiler cache.
     provenance = json.loads((metadata / 'steam-frame-source.json').read_text())
