@@ -1532,3 +1532,11 @@ target_include_directories(fsr3_disabled_adapter_test PRIVATE "${PROJECT_SOURCE_
 target_link_libraries(fsr3_disabled_adapter_test PRIVATE GTest::gtest_main Vulkan::Headers)
 mocktail_apply_compile_options(fsr3_disabled_adapter_test)
 gtest_discover_tests(fsr3_disabled_adapter_test)
+
+add_executable(desktop_mirror_test vr/desktop_mirror_test.cc)
+target_include_directories(desktop_mirror_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(desktop_mirror_test PRIVATE GTest::gtest_main Vulkan::Headers)
+mocktail_apply_compile_options(desktop_mirror_test)
+gtest_discover_tests(desktop_mirror_test)
+add_test(NAME SteamFrameDesktopMirrorPolicy COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/steam_frame_mirror_policy_test.py")

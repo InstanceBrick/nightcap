@@ -99,6 +99,24 @@ TEST(RuntimeConfigTest, UsesSupportedDefaults) {
   EXPECT_TRUE(config.unsafe_detached_thread_overrides().empty());
 }
 
+TEST(RuntimeConfigTest, DesktopMirrorDefaultsOnAndAcceptsTypedBooleans) {
+  EXPECT_TRUE(RuntimeConfig::FromEnvironment(MapEnvironment()).vr_desktop_mirror());
+  for (const char* value : {"1", "true", "on", "0", "false", "off"}) {
+    const auto config = RuntimeConfig::FromEnvironment(
+        MapEnvironment({{"MOCKTAIL_VR_DESKTOP_MIRROR", value}}));
+    EXPECT_TRUE(config.vr_valid()) << value;
+    EXPECT_EQ(config.vr_desktop_mirror(),
+              std::string(value) == "1" || std::string(value) == "true" ||
+                  std::string(value) == "on");
+  }
+  const auto invalid = RuntimeConfig::FromEnvironment(
+      MapEnvironment({{"MOCKTAIL_VR_DESKTOP_MIRROR", "maybe"}}));
+  EXPECT_FALSE(invalid.vr_valid());
+  const auto invalid_vr = RuntimeConfig::FromEnvironment(MapEnvironment(
+      {{"MOCKTAIL_VR_ENABLED", "maybe"}, {"MOCKTAIL_VR_DESKTOP_MIRROR", "1"}}));
+  EXPECT_FALSE(invalid_vr.vr_valid());
+}
+
 TEST(RuntimeConfigTest, RejectsMalformedVrEnvironmentInsteadOfEnablingIt) {
   const auto config = RuntimeConfig::FromEnvironment(
       MapEnvironment({{"MOCKTAIL_VR_ENABLED", "maybe"}}));

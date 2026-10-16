@@ -7,6 +7,7 @@ graphics:
 
 vr:
   enabled: true
+  desktop_mirror: false
   frame_rate_limit: unlimited
 
 audio:

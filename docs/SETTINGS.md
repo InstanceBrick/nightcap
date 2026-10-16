@@ -15,6 +15,7 @@ The gaze radius remains adjustable, and existing saved choices are preserved.
 | Foveated Rendering | Off uses full-density shading throughout. Quality, Balanced and Performance progressively reduce peripheral shading work. Each mode keeps the same full-detail gaze region. |
 | Gaze sharp radius | Sets the minimum full-detail region around your gaze, from 8% to 35%. Larger values preserve more of the view at full density and cost more GPU time. Hardware tile boundaries can enlarge this region. |
 | Anti Aliasing | Off, FXAA, SMAA Low or SMAA High. Filtering runs around your gaze on the composed eye image, including interface edges. SMAA High is the default. |
+| Desktop Mirror | Off by default on Frame. On displays the VR image in the desktop window as well as the headset. Relaunch Nightcap after changing it. |
 | Performance Overlay | Shows actual game FPS, headset Hz, average frame time, SteamVR GPU time and per-eye resolution at the bottom center of the headset view. It hides while the Steam menu is open and does not capture controller input. |
 | Resolution Per Eye | Sets the headset eye-buffer size. Nightcap's recommended default is 2160 × 2160 per eye; Auto and Reset to Defaults use this baseline. Explicit custom values stay selected. Changes apply after the slider settles, with a brief pause while eye buffers are rebuilt at a safe frame boundary. |
 | Display Refresh Rate | The standard profile uses 72 Hz. The launcher follows the selected per-game headset rate and any explicit Steam frame limit. Restart Nightcap after changing the rate or frame limit so Roblox's internal cap matches it. |
@@ -81,9 +82,31 @@ audio:
 An exact SDL device name can replace `default`. Input device names appear in the
 launch log.
 
-Roblox's hidden desktop viewport stays at 1920 × 1080 for stable in-game menu
-size. It is independent of the headset eye resolution. Desktop window geometry
-is not restored or saved while the VR window is hidden.
+## Desktop mirror
+
+Open SteamVR's per-game **Video** settings and set **Desktop Mirror** to **On**
+to show the VR view in a desktop window. Set it to **Off** to keep the Frame's
+single headset application without the extra desktop view. Relaunch Nightcap
+after changing this setting. The Frame default is **Off**.
+
+The Frame launcher reads the saved SteamVR mirror choice and coordinates both
+the mirror renderer and desktop-window visibility. This setting takes precedence
+over the YAML value when using the Frame launcher. Generic Nightcap launches
+can configure the mirror beside the VR option:
+
+```yaml
+vr:
+  enabled: true
+  desktop_mirror: true
+```
+
+`MOCKTAIL_VR_DESKTOP_MIRROR=1` or `0` overrides the YAML setting for generic
+launches. VR and desktop mirroring are separate options; enabling VR does not
+require the desktop mirror.
+
+Roblox's desktop viewport stays at 1920 × 1080 during VR for stable in-game
+menu size, independently of headset eye resolution. On Frame, desktop window geometry
+is not restored or saved in VR, including when the mirror is enabled.
 
 ## Files and troubleshooting
 

@@ -176,6 +176,39 @@ TEST(RuntimeConfigFileTest, VrModeSelectsOnOffOrAuto) {
   EXPECT_NE(invalid.error.find("vr.mode"), std::string::npos);
 }
 
+TEST(RuntimeConfigFileTest, DesktopMirrorYamlEnvironmentAndExportAgree) {
+  TemporaryDirectory temporary;
+  const auto file = temporary.Write(
+      "version: 1\nvr:\n  enabled: true\n  desktop_mirror: false\n");
+  const auto hidden = LoadRuntimeConfig(MapEnvironment(), file);
+  ASSERT_TRUE(hidden) << hidden.error;
+  EXPECT_FALSE(hidden.config.vr_desktop_mirror());
+  const auto visible = LoadRuntimeConfig(
+      MapEnvironment({{"MOCKTAIL_VR_DESKTOP_MIRROR", "true"}}), file);
+  ASSERT_TRUE(visible) << visible.error;
+  EXPECT_TRUE(visible.config.vr_desktop_mirror());
+  const char* previous = std::getenv("MOCKTAIL_VR_DESKTOP_MIRROR");
+  const std::optional<std::string> saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  std::string error;
+  EXPECT_TRUE(ExportRuntimeConfigEnvironment(hidden.config, &error)) << error;
+  EXPECT_STREQ(std::getenv("MOCKTAIL_VR_DESKTOP_MIRROR"), "0");
+  EXPECT_TRUE(ExportRuntimeConfigEnvironment(visible.config, &error)) << error;
+  EXPECT_STREQ(std::getenv("MOCKTAIL_VR_DESKTOP_MIRROR"), "1");
+  if (saved)
+    setenv("MOCKTAIL_VR_DESKTOP_MIRROR", saved->c_str(), 1);
+  else
+    unsetenv("MOCKTAIL_VR_DESKTOP_MIRROR");
+  const auto invalid = LoadRuntimeConfig(
+      MapEnvironment(), temporary.Write(
+          "version: 1\nvr:\n  desktop_mirror: maybe\n"));
+  EXPECT_FALSE(invalid);
+  EXPECT_NE(invalid.error.find("vr.desktop_mirror"), std::string::npos);
+  const auto invalid_environment = LoadRuntimeConfig(
+      MapEnvironment({{"MOCKTAIL_VR_DESKTOP_MIRROR", "maybe"}}), file);
+  EXPECT_FALSE(invalid_environment);
+}
+
 TEST(RuntimeConfigFileTest, VrAntiAliasingAcceptsFxaaSmaaOrOff) {
   TemporaryDirectory temporary;
   for (const char* value : {"fxaa", "smaa", "off"}) {

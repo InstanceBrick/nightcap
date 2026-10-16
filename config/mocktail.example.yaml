@@ -61,6 +61,10 @@ graphics:
   # enabled: true/false still works as on/off; set one or the other.
   # Standalone OpenXR test scene: mocktail-vr-probe --scene.
   # mode: off
+  # Boolean (default: true): also show the left-eye VR view in the desktop
+  # window. Restart Nightcap after changing this setting. Steam Frame
+  # uses its Video settings Desktop Mirror control, off by default.
+  # desktop_mirror: true
   # String (default: fxaa): smooth jagged edges in the headset. Roblox draws
   # the VR eyes without anti-aliasing; fxaa filters each eye on its way to the
   # headset. The Steam Frame profile uses its separate gaze AA control.

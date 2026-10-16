@@ -23,8 +23,8 @@ experience and its graphics settings; 72 FPS is the target.
 - Roblox's internal frame-rate cap follows the selected headset refresh rate.
 - Renderer and session handling across menu, game and game-to-game transitions.
 - Native microphone capture bridge for Roblox voice chat.
-- One **Nightcap Roblox VR** Steam entry with the original Nightcap icon and a
-  hidden desktop mirror.
+- One **Nightcap Roblox VR** Steam entry with the original Nightcap icon and an
+  optional desktop mirror. The mirror is off by default on Steam Frame.
 - Simple **Foveated Rendering**, **Gaze sharp radius** and **Anti Aliasing**
   controls in SteamVR's Video settings.
 - Optional in-headset performance overlay with actual game FPS, headset Hz,
@@ -32,10 +32,11 @@ experience and its graphics settings; 72 FPS is the target.
 
 ## Install
 
-Build and install on the Frame using the [installation guide](docs/INSTALL.md).
-The repository contains source code, build instructions and integration tools.
-The Roblox client is downloaded separately on the device; no Roblox binaries,
-account data or prebuilt runtime images are distributed here.
+Install the native ARM64 build from [Releases](https://github.com/InstanceBrick/nightcap/releases),
+or build it on the Frame using the [installation guide](docs/INSTALL.md).
+The ARM64 package contains Nightcap and its open-source runtime dependencies.
+Roblox is downloaded separately on the device. Roblox binaries, account data,
+SteamVR files and the Frame's graphics drivers are not included in the package.
 
 Current ARM64 client support: **2.742.1059 (3222)** and **2.736.1408 (2998)**.
 
@@ -45,7 +46,7 @@ Current ARM64 client support: **2.742.1059 (3222)** and **2.736.1408 (2998)**.
 
 ## About this fork
 
-This Steam Frame edition is based on the `vr` branch of
+The `steam-frame` branch is the Steam Frame edition of the `vr` branch of
 [CoderDayton/nightcap](https://github.com/CoderDayton/nightcap), itself a fork of
 [komaruworld/mocktail](https://github.com/komaruworld/mocktail). It adds the native
 ARM64 VR bridge and Frame rendering, input, audio and Steam integration changes.

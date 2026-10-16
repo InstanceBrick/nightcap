@@ -40,6 +40,30 @@ def steam_profile_scene_samples(settings):
     return 1
 
 
+def steam_profile_desktop_mirror(settings):
+    section = settings.get("nightcap") if isinstance(settings, dict) else None
+    value = section.get("desktopMirror") if isinstance(section, dict) else None
+    return type(value) in (int, float) and value == 1
+
+
+def desktop_mirror_environment(settings, arguments):
+    # The launcher supplies --vr first; later explicit VR flags win.
+    vr_enabled = True
+    for argument in arguments:
+        if argument in ("--vr", "--no-vr"):
+            vr_enabled = argument == "--vr"
+    mirror = steam_profile_desktop_mirror(settings)
+    hidden = vr_enabled and not mirror
+    return {
+        # Keep the logical Roblox UI viewport stable in either mirror mode.
+        "MOCKTAIL_WIN_WIDTH": "1920", "MOCKTAIL_WIN_HEIGHT": "1080",
+        "MOCKTAIL_WINDOW_STATE_PERSISTENCE": "0",
+        "MOCKTAIL_VR_DESKTOP_MIRROR": "1" if mirror else "0",
+        "MOCKTAIL_VR_HIDE_DESKTOP_WINDOW": "1" if hidden else "0",
+        "MOCKTAIL_SHOW_WINDOW_ON_FIRST_SWAP": "0" if hidden else "1",
+    }
+
+
 def read_steam_profile(path):
     try:
         with path.open('rb') as profile:
@@ -175,11 +199,7 @@ environment = {
     'NIGHTCAP_STEAM_APP_ID': str(steam_app_id),
     'NIGHTCAP_VR_MANIFEST': str(manifest),
     'MOCKTAIL_WIN_TITLE': 'Nightcap Roblox VR',
-    # Keep Roblox panel layout stable independently of headset render size.
-    'MOCKTAIL_WIN_WIDTH': '1920', 'MOCKTAIL_WIN_HEIGHT': '1080',
-    'MOCKTAIL_VR_DESKTOP_MIRROR': '0',
-    'MOCKTAIL_VR_HIDE_DESKTOP_WINDOW': '1',
-    'MOCKTAIL_SHOW_WINDOW_ON_FIRST_SWAP': '0',
+    **desktop_mirror_environment(steam_settings, sys.argv[1:]),
     'MOCKTAIL_CLIENT_SETTINGS_OVERRIDES_JSON': msaa_flags,
     'MOCKTAIL_FAST_FLAGS_JSON': msaa_flags,
     'MOCKTAIL_GAME_LEAVE_COMPLETES_WITHOUT_LUA_CALLBACK': '1',

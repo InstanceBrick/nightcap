@@ -1,0 +1,202 @@
+name: Steam Frame ARM64
+
+on:
+  push:
+    branches: [steam-frame]
+    tags: ['steam-frame-*']
+  pull_request:
+    branches: [steam-frame]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish a release for an existing steam-frame-* tag
+        type: boolean
+        default: false
+      release_tag:
+        description: Existing tag to build when publishing (leave empty for artifact only)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steam-frame-arm64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: localhost/nightcap-vr-arm64:frame-foveated
+  ASSET: nightcap-steam-frame-arm64.oci.tar.zst
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.release_tag || github.ref }}
+      - name: Check Native settings and package scripts
+        run: |
+          for script in build-frame-nightcap.sh packaging/steam-frame/verify_image.sh; do
+            bash -n "$script"
+          done
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          paths = list(Path('tools/steam_frame').glob('*.py'))
+          paths.append(Path('tools/steam_frame/nightcap-vr-arm64'))
+          for path in paths:
+              ast.parse(path.read_text(), filename=str(path))
+          PY
+          python3 -m unittest discover -s tests -p 'steam_frame_*_test.py'
+          node tests/steamvr_video_controls_test.js
+
+  build:
+    if: github.event_name != 'pull_request'
+    needs: source-checks
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    outputs:
+      release_tag: ${{ steps.release-target.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.release_tag || github.ref }}
+      - name: Validate release target
+        id: release-target
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          PUBLISH: ${{ inputs.publish_release }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          tag=''
+          if [[ "$EVENT" == push && "$REF_TYPE" == tag ]]; then
+            tag="$REF_NAME"
+          elif [[ "$EVENT" == workflow_dispatch && "$PUBLISH" == true ]]; then
+            tag="$REQUESTED_TAG"
+          fi
+          if [[ -n "$tag" || "$PUBLISH" == true ]]; then
+            [[ "$tag" =~ ^steam-frame-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            [[ "$(git rev-parse "refs/tags/$tag^{commit}")" == "$(git rev-parse HEAD)" ]]
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+      - name: Install container tools
+        run: |
+          test "$(uname -m)" = aarch64
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y podman zstd
+      - name: Build Native ARM64 image
+        run: |
+          sudo podman build --arch arm64 --jobs 1 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label org.opencontainers.image.title='Nightcap Steam Frame ARM64' \
+            -f packaging/steam-frame/Containerfile -t "$IMAGE" .
+      - name: Run mirror and runtime configuration regressions
+        run: |
+          sudo podman run --rm --entrypoint /bin/bash "$IMAGE" -lc '
+            set -euo pipefail
+            cmake -S /work -B /work/build-frame-arm64 -DBUILD_TESTING=ON
+            cmake --build /work/build-frame-arm64 -j3 \
+              --target desktop_mirror_test runtime_config_test runtime_config_file_test
+            /work/build-frame-arm64/tests/desktop_mirror_test
+            /work/build-frame-arm64/tests/runtime_config_test
+            /work/build-frame-arm64/tests/runtime_config_file_test
+          '
+      - name: Check payload-free image
+        run: |
+          mkdir -p dist
+          sudo bash packaging/steam-frame/verify_image.sh "$IMAGE" > dist/image-check.json
+          cat dist/image-check.json
+      - name: Export image and checksums
+        run: |
+          sudo podman save --format oci-archive "$IMAGE" | zstd -T2 -6 -o "dist/$ASSET"
+          test "$(stat -c %s "dist/$ASSET")" -lt 2147483648
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, tarfile
+          archive = pathlib.Path('dist') / os.environ['ASSET']
+          process = subprocess.Popen(['zstd', '-dc', str(archive)], stdout=subprocess.PIPE)
+          index = None
+          with tarfile.open(fileobj=process.stdout, mode='r|') as stream:
+              for member in stream:
+                  if member.name == 'index.json':
+                      index = json.load(stream.extractfile(member))
+          while process.stdout.read(1024 * 1024):
+              pass
+          if process.wait() != 0:
+              raise SystemExit('Compressed OCI archive integrity check failed')
+          manifests = index.get('manifests', []) if index else []
+          if (len(manifests) != 1 or manifests[0].get('annotations', {}).get(
+                  'org.opencontainers.image.ref.name') != os.environ['IMAGE']):
+              raise SystemExit('OCI archive must restore the normal launcher image tag')
+          print('Compressed OCI archive and launcher tag verified')
+          PY
+          cd dist
+          sha256sum "$ASSET" > "$ASSET.sha256"
+      - name: Write build metadata
+        env:
+          RELEASE_TAG: ${{ steps.release-target.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          image_id = subprocess.check_output(['sudo', 'podman', 'image', 'inspect', '--format', '{{.Id}}', os.environ['IMAGE']], text=True).strip()
+          metadata = {
+              'source': 'https://github.com/' + os.environ['GITHUB_REPOSITORY'],
+              'commit': commit, 'release_tag': os.environ['RELEASE_TAG'] or None,
+              'platform': 'linux/arm64', 'image_tag': os.environ['IMAGE'], 'image_id': image_id,
+              'archive': os.environ['ASSET'], 'upscaling': 'Native', 'fsr3_compiled': False,
+              'default_eye_size': [2160, 2160], 'default_refresh_hz': 72,
+              'default_antialiasing': 'SMAA High',
+              'checks': ['Native single-sample policy', 'refresh-rate policy', 'desktop mirror policy', 'video controls',
+                         'mirror command recording and runtime configuration',
+                         'AArch64 ELF and dynamic dependencies', 'payload and license packaging',
+                         'compressed OCI integrity and launcher tag'],
+              'runtime_testing': 'CI packaging checks do not start SteamVR or Roblox',
+              'licenses': 'Source notices and third-party notices are included under /work in the image',
+          }
+          pathlib.Path('dist/build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightcap-steam-frame-arm64
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    if: needs.build.outputs.release_tag != ''
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nightcap-steam-frame-arm64
+          path: dist
+      - name: Publish checked ARM64 package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          cd dist
+          sha256sum --check "$ASSET.sha256"
+          printf '%s\n' \
+            'Native ARM64 Steam Frame image and packaging-check metadata.' \
+            'Roblox, SteamVR and host graphics drivers are downloaded or provided separately.' \
+            'Verify the SHA256, then import with: zstd -dc nightcap-steam-frame-arm64.oci.tar.zst | podman load' \
+            'See docs/INSTALL.md in this tag for launcher and SteamVR setup.' > release-notes.md
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Steam Frame ARM64 $RELEASE_TAG" --notes-file release-notes.md \
+            "$ASSET" "$ASSET.sha256" image-check.json build-info.json

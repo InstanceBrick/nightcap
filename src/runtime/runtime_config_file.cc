@@ -170,6 +170,7 @@ bool ValidateAndMap(const ValueMap& yaml, ValueMap* environment,
       "runtime.roblox_library",
       "vr.enabled",
       "vr.mode",
+      "vr.desktop_mirror",
       "vr.anti_aliasing",
       "vr.frame_rate_limit",
       "appearance.theme",
@@ -344,6 +345,14 @@ bool ValidateAndMap(const ValueMap& yaml, ValueMap* environment,
       return false;
     }
     (*environment)["MOCKTAIL_VR_MODE"] = *mode;
+  }
+  if (const auto mirror = value("vr.desktop_mirror"); mirror.has_value()) {
+    bool parsed = false;
+    if (!ParseBoolean(*mirror, &parsed)) {
+      *error = "vr.desktop_mirror must be true or false";
+      return false;
+    }
+    (*environment)["MOCKTAIL_VR_DESKTOP_MIRROR"] = parsed ? "1" : "0";
   }
   if (const auto anti_aliasing = value("vr.anti_aliasing");
       anti_aliasing.has_value()) {
@@ -830,7 +839,7 @@ RuntimeConfigLoadResult LoadRuntimeConfig(
   } else if (!result.config.vr_valid()) {
     result.error = "VR configuration is invalid: MOCKTAIL_VR_ENABLED must be "
                    "1/0, true/false, or on/off, and MOCKTAIL_VR_MODE on, off, "
-                   "or auto";
+                   "or auto, and MOCKTAIL_VR_DESKTOP_MIRROR must be boolean";
   } else if (!result.config.device_profile_valid()) {
     result.error = "device profile is invalid";
   } else if (!result.config.input_capabilities().touch_enabled &&
@@ -984,6 +993,8 @@ bool ExportRuntimeConfigEnvironment(const RuntimeConfig& config,
                           FrameRateValue(config.frame_rate()), error) &&
       SetEnvironmentValue("MOCKTAIL_VR_FRAME_RATE_LIMIT",
                           FrameRateValue(config.vr_frame_rate()), error) &&
+      SetEnvironmentValue("MOCKTAIL_VR_DESKTOP_MIRROR",
+                          config.vr_desktop_mirror() ? "1" : "0", error) &&
       SetEnvironmentValue("MOCKTAIL_VR_ANTI_ALIASING",
                           config.vr_anti_aliasing(), error) &&
       SetEnvironmentValue("MOCKTAIL_VSYNC", config.vsync_mode(), error) &&

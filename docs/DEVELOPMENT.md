@@ -3,10 +3,10 @@
 The [installation guide](INSTALL.md) covers a complete source build on Steam
 Frame. The container recipe uses Fedora 44 ARM64 with CMake, Ninja, SDL3,
 OpenXR, Vulkan, WebKitGTK and Nightcap's other native dependencies.
-FSR 3.1 shaders are generated during the build. Fedora's `glslang` package
-provides `glslangValidator`, and `spirv-tools` provides `spirv-val` for shader
-validation; both are installed by the Frame container recipe. An existing
-development image needs these packages before rebuilding this branch.
+The Frame build enables OpenXR and the ARM64 bridge, disables runtime
+diagnostics, and uses native rendering. Fedora's `glslang` and `spirv-tools`
+packages are included for shader generation and validation. The ARM64 workflow
+builds the same container recipe and checks the package before export.
 
 ## Upstream source
 
@@ -82,38 +82,21 @@ Shader sources and their generated SPIR-V header are included. Regenerating the
 AA shaders with `tools/compile_gaze_aa.py` additionally needs `glslangValidator`.
 The SMAA sources retain their upstream license in `src/vr/smaa/`.
 
-## FSR shaders
+## Native rendering
 
-The FSR 1 reference headers and MIT license are in `src/vr/fsr`. The Vulkan
-fragment shader uses FP32 EASU around the gaze with a smooth transition to
-bilinear scaling in the periphery. SMAA runs at output resolution; RCAS then
-sharpens only the gaze disk. sRGB inputs use a raw copy to an encoded UNORM
-image so EASU avoids repeated gamma conversions. The original eye provenance,
-copy command submission and completion fence are retained.
+The shipping Frame profile uses native rendering with gaze anti-aliasing.
+MSAA and upscaling controls are absent from the Frame Video settings. The build
+sets `MOCKTAIL_ENABLE_FSR3=OFF`, so the FidelityFX SDK is not linked into the
+Frame runtime. Reference upscaler sources and their licenses remain in the tree.
 
-After changing the shader, regenerate the checked-in SPIR-V with:
+To regenerate the gaze AA shaders after changing them:
 
 ```sh
-python3 tools/compile_fsr.py .
+python3 tools/compile_gaze_aa.py .
 ```
 
-This requires `glslangValidator`. Build `fsr_upscaler_gpu_test` with testing
-enabled for offscreen checks of source replacement, repeated frames, SMAA
-ordering, gaze boundaries and alpha. Set `NIGHTCAP_AA_VALIDATE=1` to also enable
-the Vulkan validation layer and synchronization checks.
-
-The optional temporal pass is `src/vr/temporal.frag`, with rotational
-reprojection in `include/mocktail/vr/temporal_reprojection.h`. It runs after
-SMAA and before RCAS, reuses the gaze scratch region and copies only that region
-to a per-eye unsharpened history. It adds no queue submission or frame fence.
-The shader regeneration command above also rebuilds `temporal_spv.h`.
-
-FSR 3.1 uses the MIT-licensed AMD FidelityFX SDK in `third_party/fidelityfx`.
-Its gaze-region path receives matching native scene depth, projection jitter
-and motion vectors. AMD optical flow supplies image motion when native motion
-is unavailable. Each eye keeps its own temporal history; the rest of the image
-uses inexpensive spatial scaling. SDK shader generation and standalone GPU
-checks are described in the [FidelityFX build notes](../third_party/fidelityfx/README.md).
+This requires `glslangValidator`. The SMAA sources retain their upstream license
+in `src/vr/smaa/`.
 
 ## Foveation tile calibration
 
@@ -125,7 +108,7 @@ in `include/mocktail/vr/foveation_tile_bounds.h` applies only to this identity:
 - Driver name `turnip Mesa driver`, info `Mesa 26.3.0-devel (git-abc426bb62)`.
 - Driver UUID `586b9fa4514cb88b3c11a968ef4d62e4`; measured ELF build ID
   `b7e5995d0b202f06e81cd5a0f809ec1b744a0cb8`.
-- A 2160 Ã— 2160 framebuffer, one layer/subpass, single-sample
+- A 2160 × 2160 framebuffer, one layer/subpass, single-sample
   `R8G8B8A8_UNORM` color and `D32_SFLOAT` depth, plus the density attachment.
   Offsets, resolves, extra attachments, multiview and feedback/input attachments
   retain the conservative guard.
@@ -137,11 +120,11 @@ The divisor routine at `0xa9e300` returns 1 for FDM. CPU-only creation of 72
 render-pass/imageless-framebuffer combinations, covering FDM on/off and every
 standard color/depth load/store combination, produced identical budgets:
 356352 pixels for `FULL`, 350208 for `AVOID_CCU`. Their base tiles are
-480 Ã— 736 and 768 Ã— 448 respectively. FDM therefore selects 768 Ã— 448
+480 × 736 and 768 × 448 respectively. FDM therefore selects 768 × 448
 independently of shaders and load/store operations for this tuple.
 
 The GPU qualification compared a high-frequency full-density reference against
-the production map helper with its 68 Ã— 68 map and 768 Ã— 448 guard. Sweep both
+the production map helper with its 68 × 68 map and 768 × 448 guard. Sweep both
 gaze axes through `{-1, -.75, -.4, 0, .4, .75, 1}`, radii
 `{.08, .15, .22, .35}`, and all three active profiles. All 588 cases preserved
 every pixel inside the gaze disk exactly, with 588 valid fragment-invocation
@@ -167,20 +150,19 @@ Allocation, deallocation and the process-memory limit checks retain their normal
 behavior.
 
 Gaze density generation reuses per-eye pixel and half-float buffers across
-frames. The density values and gaze protection are unchanged. At a 1:1 render
-and output size with matching channel formats, FSR copies the encoded source
-pixels directly instead of reconstructing pixels that already exist. Gaze AA,
-optional temporal stabilization and RCAS keep their existing order.
+frames. The density values and gaze protection are unchanged. At a 1:1 render and output size, the native path avoids unnecessary
+reconstruction, temporal resource tracking and upscaler shader dispatches.
+Gaze anti-aliasing runs on the composed eye image.
 
 
 The Vulkan eye copy is submitted on the OpenXR binding queue before releasing
 its swapchain images, so SteamVR can enqueue composition immediately. When the
 guest device requested exactly one unprotected queue, completion is deferred
-until the next use of its AA/FSR resources. GPU queue ordering keeps subsequent guest
+until the next use of its eye-copy and anti-aliasing resources. GPU queue ordering keeps subsequent guest
 commands behind the copy. The upstream submission ring tracks command buffers, fences and source/destination
 images. Presentation dependencies are consumed on the GPU and replaced with a
 per-swapchain-image semaphore, so the CPU does not wait for the current render.
-AA descriptors and temporal history wait only for previous eye-copy users;
+AA resources wait only for previous eye-copy users;
 current-frame present dependencies are excluded from that resource wait.
 Captured source-image handles are drained before
 image destruction; queue exposure, swapchain replacement and teardown also

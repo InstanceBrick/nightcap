@@ -286,9 +286,10 @@ bool IsDisabledEnv(const char* name) {
 }
 
 bool WindowStatePersistenceSuppressed() {
-  // A hidden VR surface supplies Roblox's logical UI viewport. Restoring a
-  // tiny desktop window here magnifies in-game panels despite unchanged eyes.
-  return IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW") ||
+  // The Frame supplies a fixed logical UI viewport in both mirror modes.
+  // Restoring a tiny desktop window magnifies panels despite unchanged eyes.
+  return IsDisabledEnv("MOCKTAIL_WINDOW_STATE_PERSISTENCE") ||
+         IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW") ||
          IsEnabledEnv("MOCKTAIL_RESIZE_READINESS") ||
          IsEnabledEnv("MOCKTAIL_FULLSCREEN_READINESS") ||
          IsEnabledEnv("MOCKTAIL_INPUT_READINESS") ||

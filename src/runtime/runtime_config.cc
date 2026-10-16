@@ -202,6 +202,8 @@ RuntimeConfig RuntimeConfig::FromEnvironment(const Environment& environment) {
       config.vr_mode_ = config.vr_enabled_ ? VrMode::kOn : VrMode::kOff;
     }
   }
+  config.vr_desktop_mirror_ = ReadBoolean(
+      environment, "MOCKTAIL_VR_DESKTOP_MIRROR", true, &config.vr_valid_);
   config.roblox_library_path_ = environment.GetOr(
       "ROBLOX_LIB_PATH", config.roblox_library_path_.string());
   config.graphics_backend_name_ = environment.GetOr(

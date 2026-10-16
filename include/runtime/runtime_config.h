@@ -106,6 +106,7 @@ class RuntimeConfig {
 
   bool headless() const { return headless_; }
   bool vr_enabled() const { return vr_enabled_; }
+  bool vr_desktop_mirror() const { return vr_desktop_mirror_; }
   // MOCKTAIL_VR_ENABLED (--vr, --no-vr) wins over MOCKTAIL_VR_MODE.
   VrMode vr_mode() const { return vr_mode_; }
   bool vr_valid() const { return vr_valid_; }
@@ -184,6 +185,7 @@ class RuntimeConfig {
  private:
   bool headless_ = false;
   bool vr_enabled_ = kDefaultVrEnabled;
+  bool vr_desktop_mirror_ = true;
   VrMode vr_mode_ = kDefaultVrEnabled ? VrMode::kOn : VrMode::kOff;
   bool vr_valid_ = true;
   std::filesystem::path roblox_library_path_ = "rbx_bin/libroblox.so";

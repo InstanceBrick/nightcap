@@ -7,25 +7,41 @@
 - The Frame's Turnip/Freedreno Vulkan driver under `/usr/lib` and its Vulkan ICD
   under `/usr/share/vulkan/icd.d`.
 - Rootless Podman, Git, Python 3 and a C++17 compiler on the Frame.
+- `zstd` for importing the compressed ARM64 release archive.
 - A Linux filesystem for the checkout, internet access and space for the source,
   Fedora build image and a separate Roblox client download.
 
-The build dependencies are installed inside a Fedora 44 ARM64 container,
-including `glslangValidator` and `spirv-val` for the FSR shaders. Keep the
-Frame's own graphics drivers: the launcher mounts them into the container.
-Use a case-sensitive Linux checkout because some Android headers differ only
-by letter case. The repository is private, so GitHub access is required to clone it.
+The runtime uses Fedora 44 ARM64 in a rootless container. Keep the Frame's
+own graphics drivers: the launcher mounts them into the container. Building
+from source also needs a case-sensitive Linux checkout because some Android
+headers differ only by letter case. The source and ARM64 build are public.
 
 ## 1. Get the source
 
 ```bash
 git clone --branch steam-frame --recurse-submodules \
-  https://github.com/InstanceBrick/nightcap-steam-frame.git \
+  https://github.com/InstanceBrick/nightcap.git \
   "$HOME/.local/share/nightcap-steam-frame-src"
 cd "$HOME/.local/share/nightcap-steam-frame-src"
 ```
 
-## 2. Build Nightcap
+## 2. Install the ARM64 image
+
+Download `nightcap-steam-frame-arm64.oci.tar.zst` and its `.sha256` file from
+[Releases](https://github.com/InstanceBrick/nightcap/releases). From the
+directory containing both files:
+
+```bash
+set -euo pipefail
+sha256sum -c nightcap-steam-frame-arm64.oci.tar.zst.sha256
+zstd -dc nightcap-steam-frame-arm64.oci.tar.zst | podman load
+```
+
+The archive imports as `localhost/nightcap-vr-arm64:frame-foveated`. It contains
+the ARM64 Nightcap runtime and its Fedora dependencies, with no Roblox client,
+personal data, SteamVR installation or proprietary graphics drivers.
+
+To build the same image from source instead:
 
 ```bash
 podman build --arch arm64 --jobs 1 \
@@ -119,7 +135,12 @@ files instead of copying the already patched dashboard.
 
 ## Update Nightcap
 
-Close Nightcap, pull this branch and rebuild under a temporary image tag:
+Close Nightcap before replacing its image or launcher. Pull the `steam-frame`
+branch, then load the new ARM64 release archive as in step 2 and rerun the
+launcher installer. Existing Roblox downloads, sign-in state and settings stay
+in the separate data directory.
+
+For source builds, pull this branch and rebuild under a temporary image tag:
 
 ```bash
 git pull --ff-only

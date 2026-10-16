@@ -3,6 +3,7 @@
 #include "mocktail/vr/anti_aliasing_settings.h"
 #include <nlohmann/json.hpp>
 #include "mocktail/vr/openxr_backend.h"
+#include "mocktail/vr/desktop_mirror.h"
 #include "mocktail/vr/vr_perf.h"
 #include "mocktail/vr/vr_pose_math.h"
 #include "mocktail/vr/foveation_focus.h"
@@ -5423,59 +5424,11 @@ VkResult OpenXrBackend::MirrorDesktop(VkQueue queue,
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (vk_->BeginCommandBuffer(command, &begin) != VK_SUCCESS)
     return VK_NOT_READY;
-  VkImageMemoryBarrier barriers[2]{};
-  for (auto &b : barriers) {
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-  }
-  barriers[0].image = eyes_[0].image;
-  barriers[0].oldLayout = eyes_[0].final_layout;
-  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-  barriers[1].image = target.images[info->pImageIndices[0]];
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  vk_->CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                          nullptr, 2, barriers);
-  const VkClearColorValue black{{0.f, 0.f, 0.f, 1.f}};
-  vk_->CmdClearColorImage(command, barriers[1].image,
-                          barriers[1].newLayout, &black, 1,
-                          &barriers[1].subresourceRange);
-  VkMemoryBarrier clear_barrier{};
-  clear_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  clear_barrier.srcAccessMask = clear_barrier.dstAccessMask =
-      VK_ACCESS_TRANSFER_WRITE_BIT;
-  vk_->CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &clear_barrier,
-                          0, nullptr, 0, nullptr);
-  const double scale = std::min(double(target.extent.width) / eyes_[0].width,
-                                double(target.extent.height) / eyes_[0].height);
-  const int width = std::max(1, int(eyes_[0].width * scale));
-  const int height = std::max(1, int(eyes_[0].height * scale));
-  const int x = (int(target.extent.width) - width) / 2;
-  const int y = (int(target.extent.height) - height) / 2;
-  VkImageBlit region{};
-  region.srcSubresource =
-      region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.srcOffsets[1] = {static_cast<int>(eyes_[0].width),
-                          static_cast<int>(eyes_[0].height), 1};
-  region.dstOffsets[0] = {x, y, 0};
-  region.dstOffsets[1] = {x + width, y + height, 1};
-  vk_->CmdBlitImage(command, barriers[0].image, barriers[0].newLayout,
-                    barriers[1].image, barriers[1].newLayout, 1, &region,
-                    VK_FILTER_NEAREST);
-  for (auto &b : barriers) {
-    std::swap(b.oldLayout, b.newLayout);
-    b.srcAccessMask = b.dstAccessMask;
-    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-  }
-  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
-                          nullptr, 2, barriers);
+  const VkImage destination = target.images[info->pImageIndices[0]];
+  internal::RecordDesktopMirrorCommands(
+      command, eyes_[0].image, eyes_[0].final_layout,
+      {eyes_[0].width, eyes_[0].height}, destination, target.extent,
+      {vk_->CmdPipelineBarrier, vk_->CmdClearColorImage, vk_->CmdBlitImage});
   if (vk_->EndCommandBuffer(command) != VK_SUCCESS)
     return VK_NOT_READY;
   std::vector<VkPipelineStageFlags> stages(info->waitSemaphoreCount,
@@ -5491,7 +5444,7 @@ VkResult OpenXrBackend::MirrorDesktop(VkQueue queue,
   // wait also orders the eye copies submitted later on this queue.
   submit.signalSemaphoreCount = 1;
   submit.pSignalSemaphores = &signal;
-  slot->images = {eyes_[0].image, barriers[1].image};
+  slot->images = {eyes_[0].image, destination};
   const VkResult result = SubmitAsyncLocked(queue, slot, submit);
   if (result != VK_SUCCESS)
     return result;

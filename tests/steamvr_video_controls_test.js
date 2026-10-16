@@ -15,23 +15,39 @@ function harness(saved={}){
       GetSettingsValue:setting=>{reads.push(setting);return Promise.resolve(saved[setting.split('/').at(-1)]);},
       SetSettingsStringValueWithoutSchema:(setting,value)=>writes.push([setting,value])}}};
   vm.createContext(context);vm.runInContext(source,context);
-  return{writes,reads,get state(){return state;},render(){refIndex=0;const rows=context.NightcapVideoControls({}).children.filter(Boolean);first=false;return rows;},
+  return{writes,reads,get state(){return state;},render(){refIndex=0;const rows=context.NightcapVideoControls({}).children.filter(value=>value&&value.props.label);first=false;return rows;},
     async load(){for(const effect of effects)effect();await Promise.resolve();await Promise.resolve();},
     async poll(){for(const timer of timers)timer();await Promise.resolve();await Promise.resolve();},advance:ms=>{now+=ms;}};
 }
 const row=(rows,label)=>{const result=rows.find(value=>value.props.label===label);assert(result,`Missing ${label}`);return result;};
 (async()=>{
   const defaults=harness();let rows=defaults.render();
-  assert.deepEqual(rows.map(value=>value.props.label),['Foveated Rendering','Gaze sharp radius','Performance Overlay','Anti Aliasing']);
+  assert.deepEqual(rows.map(value=>value.props.label),['Foveated Rendering','Gaze sharp radius','Desktop Mirror','Performance Overlay','Anti Aliasing']);
   assert.equal(row(rows,'Foveated Rendering').props.value,3);assert.equal(row(rows,'Anti Aliasing').props.value,3);
   assert.deepEqual(Array.from(row(rows,'Anti Aliasing').props.items,item=>[item.value,item.sLabel]),[[0,'Off'],[1,'FXAA (gaze)'],[2,'SMAA Low (gaze)'],[3,'SMAA High (gaze)']]);
   assert(rows.every(value=>!('title'in value.props)&&!('description'in value.props)&&!('help'in value.props)));
-  assert(!/FSR|MSAA|upscal|relaunch|sharpen/i.test(source));
+  assert(!/FSR|MSAA|upscal|sharpen/i.test(source));
+  assert(source.includes('Desktop Mirror changes require relaunch.'));
+  assert.equal(row(rows,'Desktop Mirror').props.value,0);
+  for(const desktopMirror of [0,1]){
+    const mirror=harness({desktopMirror});mirror.render();await mirror.load();rows=mirror.render();
+    assert.equal(row(rows,'Desktop Mirror').props.value,desktopMirror);
+    assert.equal(mirror.writes.length,0);
+    row(rows,'Desktop Mirror').props.onChange(1-desktopMirror);
+    assert.deepEqual(mirror.writes.at(-1),['/settings/nightcap/desktopMirror',1-desktopMirror]);
+    const count=mirror.writes.length;for(const value of [-1,2,NaN])row(rows,'Desktop Mirror').props.onChange(value);
+    assert.equal(mirror.writes.length,count);
+  }
+  for(const desktopMirror of [true,false,'1','0',[1],[],{},2,-1,NaN]){
+    const invalid=harness({desktopMirror});invalid.render();await invalid.load();rows=invalid.render();
+    assert.equal(row(rows,'Desktop Mirror').props.value,0,'Only saved numeric0/1 mirror values are accepted');
+    assert.equal(invalid.writes.length,0);
+  }
   for(const aaMode of [0,1,2,3]){
     const saved=harness({aaMode,gazeRadiusPercent:8,performanceOverlay:1,foveationLevel:3,upscaleMode:3,fsrQuality:5,msaaSamples:4});
     saved.render();await saved.load();rows=saved.render();
     assert.equal(row(rows,'Anti Aliasing').props.value,aaMode);assert.equal(saved.state.gazeRadiusPercent,8);assert.equal(row(rows,'Performance Overlay').props.value,true);
-    assert.deepEqual(Object.keys(saved.state).sort(),['aaMode','foveationLevel','gazeRadiusPercent','performanceOverlay']);
+    assert.deepEqual(Object.keys(saved.state).sort(),['aaMode','desktopMirror','foveationLevel','gazeRadiusPercent','performanceOverlay']);
     assert.equal(saved.writes.length,0,'Loading saved choices must not write defaults');
     assert(saved.reads.every(setting=>!/(FSR|MSAA|upscale)/i.test(setting)));
     row(rows,'Anti Aliasing').props.onChange(3);assert.deepEqual(saved.writes.at(-1),['/settings/nightcap/aaMode',3]);
