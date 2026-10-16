@@ -13,8 +13,8 @@
 namespace mocktail {
 namespace runtime {
 
-// Nightcap defaults this on and keeps it on only outside games; a user value
-// set in fflags.json or the overrides environment disables the switching.
+// A user value in fflags.json or the overrides environment disables switching.
+// ARM64 prepares the writable flag before enabling menu code generation.
 inline constexpr std::string_view kLuauCodegenAllClientSetting =
     "FFlagDebugLuauCodegenAll";
 inline constexpr std::string_view kLuauCodegenAllFastFlagName =
@@ -38,8 +38,8 @@ bool ClientSettingsSetLuauCodegenAll(std::string_view overrides_json);
 
 bool LuauCodegenAllForPhase(RobloxExperiencePresencePhase phase);
 
-// Locates the flag on the first notification; a byte that is not 0 or 1 is
-// left alone.
+// Locates the flag once; a missing/ambiguous record or non-boolean byte is left
+// alone. Automatic ARM64 startup must not force the flag on before preparation.
 class LuauCodegenMenuSwitch {
  public:
   using LocateFlagFn = std::function<std::uint8_t*()>;
@@ -47,6 +47,9 @@ class LuauCodegenMenuSwitch {
   LuauCodegenMenuSwitch(LocateFlagFn locate_flag,
                         RobloxExperiencePresenceObserver next);
 
+  // Call after constructors/settings initialization, before starting LuaApp.
+  // Does not notify the downstream presence observer. False leaves it unchanged.
+  bool PrepareForMenus();
   RobloxExperiencePresenceObserver observer();
   void OnPhase(RobloxExperiencePresencePhase phase,
                const RobloxExperienceLaunchRequest* request);
@@ -54,6 +57,7 @@ class LuauCodegenMenuSwitch {
  private:
   static void Notify(void* context, RobloxExperiencePresencePhase phase,
                      const RobloxExperienceLaunchRequest* request);
+  bool SetEnabledLocked(bool enabled);
 
   std::mutex mutex_;
   LocateFlagFn locate_flag_;

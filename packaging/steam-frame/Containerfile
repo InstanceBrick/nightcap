@@ -1,0 +1,21 @@
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf -y install \
+    gcc-c++ cmake ninja-build git pkgconf-pkg-config lld binutils python3 \
+    glslang spirv-tools \
+    SDL3-devel SDL3_ttf-devel libcurl-devel openssl-devel json-devel \
+    libyaml-devel libpng-devel elfutils-libelf-devel minizip-ng-compat-devel \
+    capstone-devel gtk4-devel libadwaita-devel webkitgtk6.0-devel \
+    utf8proc-devel fontconfig-devel libglvnd-devel vulkan-headers \
+    vulkan-loader-devel libplacebo-devel zlib-ng-compat-devel \
+    mesa-dri-drivers mesa-vulkan-drivers mesa-libEGL mesa-libGL mesa-libgbm \
+    pipewire-libs pulseaudio-libs alsa-lib dbus-libs libnotify \
+    && dnf clean all
+
+WORKDIR /work
+COPY . /work
+RUN bash /work/build-frame-nightcap.sh
+
+ENV PATH="/opt/nightcap-vr-arm64/bin:${PATH}"
+ENTRYPOINT ["/opt/nightcap-vr-arm64/lib64/mocktail/mocktail"]
+CMD ["--vr"]

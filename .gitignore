@@ -180,3 +180,20 @@ lsan.log*
 
 # Working plans, not part of the shipped documentation
 /docs/plans/
+
+# Steam Frame local builds and generated SteamVR assets
+/build-frame-arm64/
+/frame-ui-local/
+/tools/steam_frame/steamvr-*.original.*
+/tools/steam_frame/steamvr-*.sharpening.*
+/tools/steam_frame/steamvr-sharpening-ui-patch.json
+/steam-shortcut.json
+
+# Local Frame payloads, images and source-transfer archives
+/data/
+/host-drivers/
+*.bundle
+*.oci
+*.img
+/current.json
+/previous_good.json

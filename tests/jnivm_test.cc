@@ -33,6 +33,8 @@ protected:
     unsetenv("MOCKTAIL_TRACE_ALL");
     unsetenv("MOCKTAIL_FULL_TRACE");
     unsetenv("MOCKTAIL_RESOLVED_THEME_INTERNAL");
+    unsetenv("MOCKTAIL_VR_ENABLED");
+    unsetenv("MOCKTAIL_VR_DISPLAY_HZ");
     vm_ = std::make_shared<VM>();
   }
 
@@ -44,6 +46,8 @@ protected:
     unsetenv("MOCKTAIL_TRACE_ALL");
     unsetenv("MOCKTAIL_FULL_TRACE");
     unsetenv("MOCKTAIL_RESOLVED_THEME_INTERNAL");
+    unsetenv("MOCKTAIL_VR_ENABLED");
+    unsetenv("MOCKTAIL_VR_DISPLAY_HZ");
   }
 
   std::shared_ptr<VM> vm_;
@@ -832,6 +836,32 @@ TEST_F(JniVmTest, CallbackReceivesCorrectJniEnv) {
   (*cb)(vm_->GetJNIEnv(), nullptr);
 
   EXPECT_EQ(received_env, vm_->GetJNIEnv());
+}
+
+jfloat CallRefreshFloatV(JNIEnv* env,jobject object,jmethodID method,...) {
+  va_list args;va_start(args,method);const auto result=env->CallFloatMethodV(object,method,args);va_end(args);return result;
+}
+TEST_F(JniVmTest, VrRefreshUsesActiveHmdAcrossAllFloatCallsAndIntegerBridge) {
+  auto* env=vm_->GetJNIEnv();
+  const auto cls=env->FindClass("android/view/Display");ASSERT_NE(cls,nullptr);
+  const auto object=env->AllocObject(cls);ASSERT_NE(object,nullptr);
+  const auto method=env->GetMethodID(cls,"getRefreshRate","()F");ASSERT_NE(method,nullptr);
+  env->SetFloatField(object,env->GetFieldID(cls,"refreshRate","F"),72.f);
+  setenv("MOCKTAIL_VR_ENABLED","1",1);setenv("MOCKTAIL_VR_DISPLAY_HZ","96",1);
+  EXPECT_FLOAT_EQ(env->CallFloatMethod(object,method),96.f);
+  EXPECT_FLOAT_EQ(CallRefreshFloatV(env,object,method),96.f);
+  EXPECT_FLOAT_EQ(env->CallFloatMethodA(object,method,nullptr),96.f);
+  const auto integer=env->GetStaticMethodID(cls,"getRefreshRate","()I");
+  EXPECT_EQ(env->CallStaticIntMethod(cls,integer),96);
+  // Reject invalid input and preserve ordinary object-field behaviour.
+  for(const char* bad:{"nan","inf","0","241","96garbage"}) {
+    setenv("MOCKTAIL_VR_DISPLAY_HZ",bad,1);
+    EXPECT_FLOAT_EQ(env->CallFloatMethod(object,method),72.f);
+    EXPECT_EQ(env->CallStaticIntMethod(cls,integer),60);
+  }
+  setenv("MOCKTAIL_VR_DISPLAY_HZ","96",1);setenv("MOCKTAIL_VR_ENABLED","0",1);
+  EXPECT_FLOAT_EQ(env->CallFloatMethod(object,method),72.f);
+  EXPECT_EQ(env->CallStaticIntMethod(cls,integer),60);
 }
 
 TEST_F(JniVmTest, NetworkUtilsReturnsMockIpv4Address) {

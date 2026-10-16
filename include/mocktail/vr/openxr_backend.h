@@ -8,12 +8,21 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include <memory>
 
 #include "mocktail/status.h"
+#include "mocktail/vr/xr_foveation_maps.h"
+#include "mocktail/vr/gaze_aa.h"
+#include "mocktail/vr/fsr_upscaler.h"
+#include "mocktail/vr/fsr3_scene_capture.h"
+#ifdef MOCKTAIL_ENABLE_FSR3
+#include "mocktail/vr/fsr3_upscaler.h"
+#include "mocktail/vr/fsr3_gaze_transport.h"
+#endif
 #include "mocktail/vr/virtual_keyboard.h"
 #include "mocktail/vr/vr_mirror.h"
 #include "mocktail/vr/xr_actions.h"
@@ -22,6 +31,12 @@
 namespace mocktail::vr {
 
 namespace internal {
+// Deferral is safe only when the guest requested exactly one unprotected queue.
+bool SingleUnprotectedVulkanQueue(const VkDeviceCreateInfo* info);
+// Frame's native Video slider stores a per-eye pixel dimension per app.
+std::uint32_t SteamFrameEyeResolution(std::string_view settings,
+                                     std::string_view steam_app_id);
+
 // Swapchain format for guest eyes of `eye` given the runtime's formats:
 // `eye` itself, else its UNORM/SRGB sibling (a raw byte copy, since the guest
 // writes sRGB-encoded bytes either way), else the other channel order with
@@ -89,6 +104,9 @@ struct ScriptedPoseSample {
   float orientation[4] = {0.f, 0.f, 0.f, 1.f};
   float eye_offset[2][3] = {};  // metres in head space
   float eye_fov[2][4] = {};  // left, right, up, down angles
+  float projection_jitter_pixels[2] = {};  // raster displacement: right/down
+  std::uint32_t projection_render_width = 0, projection_render_height = 0;
+  bool projection_jitter_valid = false;
   // Index 0 = left, 1 = right (Roblox UserCFrame LeftHand/RightHand).
   VrHandPose hands[2];
   float floor_position[3] = {};
@@ -160,8 +178,25 @@ class OpenXrBackend final {
                           const VkDeviceCreateInfo* create_info,
                           const VkAllocationCallbacks* allocator,
                           VkDevice* device, VkResult* result);
-  void NoteDeviceDestroyed(VkDevice device);
-  void NoteInstanceDestroyed(VkInstance instance);
+  // True transfers native device destruction to this backend.
+  bool NoteDeviceDestroyed(VkDevice device);
+  bool FoveationEnabled(VkDevice device) const;
+  VkImageView FoveationViewForFramebuffer(VkDevice device, VkFramebuffer framebuffer);
+  bool FoveationFocus(VkDevice device,VkFramebuffer framebuffer,float* x,float* y,std::uint64_t* frame,int* eye,int* level);
+  bool FoveationSnapshot(VkDevice device,float* centers,float* radius,std::uint64_t* frame,int* level);
+  // A scene intermediate may be shared between eyes. Resolve it from the live
+  // eye getter, never from its framebuffer handle or dimensions alone.
+  bool FoveationRenderFocus(VkDevice device, VkFramebuffer framebuffer,
+      std::uint32_t scene_width, std::uint32_t scene_height, float* x, float* y,
+      float* radius, std::uint64_t* frame, int* eye, int* level);
+  bool FoveationHostCopyEnabled(VkDevice device) const;
+  bool Fsr3InputsAvailable() const;
+  bool Fsr3InputsEnabled() const;
+  void CaptureFsr3Scene(VkDevice, VkCommandBuffer, const TemporalSceneInputs&);
+  void CaptureFsr3Motion(VkDevice, VkCommandBuffer, const TemporalMotionInputs&);
+  VkExtent2D FoveationMapExtent(VkDevice device) const;
+  // True transfers native instance destruction to this backend.
+  bool NoteInstanceDestroyed(VkInstance instance);
   void NoteQueue(VkDevice device, VkQueue queue, std::uint32_t family,
                  std::uint32_t index);
   std::vector<std::uint32_t> DesktopQueueFamilies(VkDevice device) const;
@@ -182,6 +217,11 @@ class OpenXrBackend final {
                                         std::uint32_t* destination,
                                         VkImageLayout* old_layout,
                                         VkImageLayout new_layout);
+
+  void NormalizeDesktopBarriers(VkCommandBuffer command, std::uint32_t count,
+                                 VkImageMemoryBarrier* barriers);
+  void NormalizeDesktopBarriers(VkCommandBuffer command, std::uint32_t count,
+                                 VkImageMemoryBarrier2* barriers);
 
   // Resource provenance recording (adapter wrappers).
   bool WantsResourceRecords() const {
@@ -228,6 +268,9 @@ class OpenXrBackend final {
   // poses (metres, LOCAL space) when a controller layer is active.
   ScriptedPoseSample PublishedHeadPose() const;
   bool RecommendedEyeExtent(std::uint32_t* width, std::uint32_t* height) const;
+  // Render-thread boundary only: rebuild XR targets when Steam's settled
+  // resolution changes. The guest then reruns its verified eye initializer.
+  bool UpdateEyeResolution();
   void NotePoseApplied(void* owner, std::uint64_t frame);
 
   // Controller input delivery, consumed by the window-thread input runtime
@@ -255,6 +298,11 @@ class OpenXrBackend final {
   std::string runtime_name() const;
 
  private:
+  VkImageLayout NormalizeDesktopBarrierLocked(std::uint32_t family,
+      VkImage image, std::uint32_t* source, std::uint32_t* destination,
+      VkImageLayout* old_layout, VkImageLayout new_layout);
+  bool FoveationSnapshotLocked(VkDevice,float*,float*,std::uint64_t*,int*);
+  int FoveationSceneEyeLocked(VkDevice, std::uint32_t, std::uint32_t) const;
   friend struct OpenXrBackendTestAccess;
   struct ImageRecord {
     VkImage image = VK_NULL_HANDLE;
@@ -272,6 +320,7 @@ class OpenXrBackend final {
     std::uint64_t frame = 0;
     VkImage image = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    void* guest_framebuffer = nullptr;
     VkImageLayout final_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     void* owner = nullptr;
     std::uint32_t width = 0;
@@ -323,6 +372,7 @@ class OpenXrBackend final {
   bool RuntimeUsesGuestGpuLocked();
   void PollSessionEvents();
   bool SupportsPresentQueueLocked(VkQueue queue) const;
+  VkQueue FrameQueueForPresentLocked(VkQueue queue) const;
   VkQueue GraphicsQueueForPresentLocked(VkQueue present) const;
   bool unsupported_present_queue_logged_ = false;
   // Drops the pose/images of the frame currently in flight without touching
@@ -333,11 +383,13 @@ class OpenXrBackend final {
   // Returns true when the backend owns this present but ran no XR frame, so
   // the caller paces the guest itself.
   bool NoteHostPresentLocked(VkQueue queue, VkDevice device);
+  bool NeedsIdlePacingLocked() const;
   bool CreateSwapchains(std::string* error);
   // Recreates the eye swapchains once in the format that copies the guest's
   // eye bytes without a gamma change (see PreferredEyeSwapchainFormat).
   void MatchSwapchainFormatToEyesLocked();
   void DestroySwapchains();
+  void ResetFsr3Locked();
   bool EnsureCopyResources(VkDevice device, std::uint32_t queue_family,
                            std::string* error);
   void DestroyCopyResources();
@@ -347,7 +399,7 @@ class OpenXrBackend final {
   bool CopyEyesIntoSwapchains(VkQueue queue);
   void RecordEyeCopiesLocked(VkCommandBuffer command, const VkImage source[2],
                              const VkImage destination[2]);
-  void RecordFilteredEyesLocked(VkCommandBuffer command, bool smaa);
+  void RecordFxaaEyesLocked(VkCommandBuffer command);
   // Per-frame GPU work (desktop mirror, eye copies) is submitted without a CPU
   // wait. A slot is reused only after its fence signalled; its images let a
   // guest destroy wait for the submissions that still read them.
@@ -355,6 +407,7 @@ class OpenXrBackend final {
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
+    bool eye_resources = false;
     std::uint64_t serial = 0;  // bumped per submission
     std::vector<VkImage> images;
   };
@@ -392,60 +445,13 @@ class OpenXrBackend final {
     std::vector<VkFramebuffer> framebuffers[2];
     bool failed = false;
   };
-  // vr.anti_aliasing. SMAA shares FXAA's final pass, targets and eye views.
-  enum class AntiAliasing { kOff, kFxaa, kSmaa };
-  AntiAliasing AntiAliasingMode() const;
+  bool FxaaEnabled() const;
   // Pipeline, targets and eye bindings for this frame; false means copy.
   bool PrepareFxaaLocked();
   bool CreateFxaaPipelineLocked(VkFormat target_format);
-  bool CreateFullscreenPipelineLocked(VkShaderModule vertex,
-                                      VkShaderModule fragment,
-                                      VkPipelineLayout layout,
-                                      VkRenderPass render_pass,
-                                      VkPipeline* pipeline);
   void DestroyFxaaTargetsLocked();
   void ForgetFxaaSourceLocked(VkImage image);
   void DestroyFxaaLocked();
-  // SMAA: edge detection and blending weights into per-eye images, then
-  // neighborhood blending into FXAA's swapchain targets.
-  struct SmaaPass {
-    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
-    VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkRenderPass render_pass = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkDescriptorSet sets[2] = {};
-  };
-  struct SmaaImage {
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
-  };
-  struct SmaaState {
-    std::vector<VkShaderModule> modules;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    SmaaPass edges, weights, blend;
-    SmaaImage area, search;
-    // Per eye, at the eye's extent.
-    SmaaImage edge_images[2], weight_images[2];
-    VkFramebuffer edge_framebuffers[2] = {};
-    VkFramebuffer weight_framebuffers[2] = {};
-    std::uint32_t width = 0, height = 0;
-    VkFormat target_format = VK_FORMAT_UNDEFINED;
-    // The eye views the edge and blend sets were written with.
-    VkImageView bound_sources[2] = {};
-    bool failed = false;
-  };
-  bool PrepareSmaaLocked();
-  bool CreateSmaaPipelinesLocked();
-  bool CreateSmaaImageLocked(VkFormat format, std::uint32_t width,
-                             std::uint32_t height, VkImageUsageFlags usage,
-                             SmaaImage* out);
-  bool UploadSmaaLookupLocked(SmaaImage* image, std::uint32_t width,
-                              std::uint32_t height, const void* bytes,
-                              std::size_t size);
-  void DestroySmaaImageLocked(SmaaImage* image);
-  void DestroySmaaTargetsLocked();
-  void DestroySmaaLocked();
   // The next slot, recorded-ready, or nullptr when its previous submission
   // did not finish in time (the device is hung or lost).
   AsyncSubmission* NextAsyncSubmissionLocked();
@@ -454,6 +460,9 @@ class OpenXrBackend final {
   // Waits for pending submissions reading `image`, or all of them for
   // VK_NULL_HANDLE.
   void WaitAsyncSubmissionsLocked(VkImage image);
+  // AA/FSR descriptors and history are shared between eye copies. Wait only
+  // for their previous users, never the current guest-present dependency.
+  void WaitEyeResourcesLocked();
   // Semaphore the present of `image_index` waits on, created on first use.
   enum class PresentStep { kMirror, kPrepare };
   VkSemaphore PresentReadySemaphoreLocked(VkSwapchainKHR swapchain,
@@ -503,6 +512,10 @@ class OpenXrBackend final {
   void* xr_stage_space_ = nullptr;
   std::uint32_t xr_eye_width_[2] = {};
   std::uint32_t xr_eye_height_[2] = {};
+  std::uint32_t xr_max_eye_width_[2] = {};
+  std::uint32_t xr_max_eye_height_[2] = {};
+  std::uint32_t resize_candidate_ = 0;
+  std::uint64_t resize_candidate_since_ = 0;
   EyeSwapchain eye_swapchains_[2];
   VirtualKeyboard keyboard_;
   std::unique_ptr<VirtualKeyboardRasterizer> keyboard_raster_;
@@ -531,11 +544,52 @@ class OpenXrBackend final {
   std::string runtime_manifest_;
 
   VkInstance vk_instance_ = VK_NULL_HANDLE;
+  std::uint32_t vk_instance_api_version_ = VK_API_VERSION_1_0;
+  bool fsr3_device_supported_ = false;
+  // One retained instance avoids invalid SteamVR ARM graphics-device caches
+  // during menu/game transitions. Only an identical creation request reuses it.
+  bool vk_instance_retained_ = false;
+  bool vk_device_retained_ = false;
+  bool foveation_runtime_available_ = false;
+  bool eye_gaze_available_ = false;
+  bool foveation_device_enabled_ = false;
+  bool foveation_host_copy_enabled_ = false;
+  bool foveation_used_in_frame_ = false;
+  XrFoveationMaps foveation_;
+  GazeAa gaze_aa_;
+  FsrUpscaler fsr_;
+  Fsr3SceneCapture fsr3_capture_;
+#ifdef MOCKTAIL_ENABLE_FSR3
+  Fsr3Upscaler fsr3_;
+  Fsr3GazeTransport fsr3_transport_;
+#endif
+  std::atomic<bool> fsr3_inputs_enabled_{false};
+  bool fsr3_failure_logged_ = false;
+  std::uint64_t fsr3_last_frame_ns_ = 0;
+  std::uint64_t fsr3_last_frame_ = 0;
+  bool fsr3_has_resources_ = false;
+  bool fsr3_capture_seen_[2]{};
+  float fsr3_gaze_radius_ = -1.f;
+  bool fsr3_contexts_configured_ = false;
+  bool fsr3_estimate_motion_ = true;
+  bool fsr3_depth_inverted_ = false, fsr3_depth_infinite_ = false;
+  std::uint64_t fsr3_camera_identity_[2]{};
+  float fsr3_camera_near_[2]{}, fsr3_camera_far_[2]{};
+  static constexpr int upscale_mode_ = 0;
+    FsrSettings fsr_settings_{};
+  bool fsr_failure_logged_ = false;
+  std::string guest_device_key_;
+  static std::string VulkanDeviceKey(const VkDeviceCreateInfo* info);
+  void ReleaseGuestRendererLocked();
+  unsigned guest_device_generation_ = 0;
+  bool defer_initial_session_ = false;
+  std::string guest_instance_key_;
   VkDevice vk_device_ = VK_NULL_HANDLE;
   VkPhysicalDevice vk_physical_device_ = VK_NULL_HANDLE;
   std::uint32_t vk_queue_family_ = 0;
   VkQueue vk_graphics_queue_ = VK_NULL_HANDLE;
   std::vector<std::uint32_t> device_queue_families_;
+  bool single_guest_queue_ = false;
   void* vk_loader_ = nullptr;
   struct VkProcs;
   VkProcs* vk_ = nullptr;
@@ -550,7 +604,6 @@ class OpenXrBackend final {
   std::size_t next_async_ = 0;
   MirrorReadback mirror_readback_{};
   FxaaState fxaa_{};
-  SmaaState smaa_{};
   // The mirror's signal for this present, which PrepareHostPresent passes on.
   VkSemaphore mirror_ready_ = VK_NULL_HANDLE;
   // Semaphores of destroyed desktop swapchains. A present may still wait on
@@ -631,6 +684,8 @@ class OpenXrBackend final {
   bool projection_rejection_logged_ = false;
   mutable ScriptedPoseSample published_pose_;
   std::uint64_t xr_frame_counter_ = 0;
+  // All begun XR frames, including an unworn/invisible headset.
+  std::uint64_t xr_begun_frames_ = 0;
   std::unordered_map<void*, std::uint64_t> applied_poses_;
 };
 

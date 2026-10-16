@@ -1,12 +1,24 @@
+#include "mocktail/graphics/vulkan_barrier_adjustment.h"
+#include "mocktail/vr/async_settings.h"
+#include "mocktail/vr/anti_aliasing_settings.h"
+#include <nlohmann/json.hpp>
 #include "mocktail/vr/openxr_backend.h"
 #include "mocktail/vr/vr_perf.h"
 #include "mocktail/vr/vr_pose_math.h"
+#include "mocktail/vr/foveation_focus.h"
+#include "mocktail/vr/performance_telemetry.h"
+#include "mocktail/vr/render_core_preference.h"
+#ifdef MOCKTAIL_ENABLE_FSR3
+#include "mocktail/vr/native_projection.h"
+#include "mocktail/vr/fsr3_device_features.h"
+#include "mocktail/vr/fsr3_runtime_device.h"
+#endif
+#if defined(__linux__) && defined(__aarch64__)
+#include <sched.h>
+#endif
 
 #include "vr/gles_transport.h"
 #include "vr/vr_shaders_spirv.h"
-// SMAA's precomputed area and search lookup textures (third_party/smaa).
-#include "Textures/AreaTex.h"
-#include "Textures/SearchTex.h"
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 
@@ -41,12 +53,106 @@ namespace mocktail::vr {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+void PreferAllowedPerformanceCores() {
+#if defined(__linux__) && defined(__aarch64__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("MOCKTAIL_VR_PREFER_PERFORMANCE_CORES");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  static thread_local bool attempted = false;
+  if (!enabled || attempted) return;
+  attempted = true;
+  cpu_set_t current;
+  CPU_ZERO(&current);
+  if (sched_getaffinity(0, sizeof(current), &current) != 0) return;
+  std::vector<internal::CpuCapacity> capacities;
+  for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (!CPU_ISSET(cpu, &current)) continue;
+    unsigned capacity = 0;
+    std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                       "/cpu_capacity");
+    if (!(file >> capacity) || !capacity) return;
+    capacities.push_back({cpu, capacity});
+  }
+  const auto selected = internal::PerformanceCpuSubset(capacities);
+  if (selected.size() == capacities.size()) return;
+  cpu_set_t preferred;
+  CPU_ZERO(&preferred);
+  for (const auto cpu : selected) CPU_SET(cpu, &preferred);
+  if (sched_setaffinity(0, sizeof(preferred), &preferred) == 0)
+    std::fprintf(stderr,
+        "  [vr-backend] render thread prefers %zu performance cores within its %zu allowed CPUs\n",
+        selected.size(), capacities.size());
+#endif
+}
+
+struct VideoSettings { int foveation=3; int aa_mode=3; float gaze_radius=.15f; std::uint32_t eye_resolution=2160; };
+VideoSettings ReadVideoSettingsFile(VideoSettings value) {
+  // This runs once during startup, then only on the settings worker.
+  static std::string previous;
+  std::ifstream file("/opt/frame-steamvr-config/steamvr.vrsettings",std::ios::binary);
+  std::array<char,262145> bytes{};
+  if(!file)return value;
+  file.read(bytes.data(),bytes.size());const auto size=file.gcount();
+  if(size<=0 || size>=static_cast<std::streamsize>(bytes.size()))return value;
+  const std::string contents(bytes.data(),static_cast<std::size_t>(size));
+  if(contents==previous)return value;
+  const auto json=nlohmann::json::parse(contents,nullptr,false);
+  if(!json.is_object())return value;
+  previous=contents;
+  const char* steam_id=std::getenv("NIGHTCAP_STEAM_APP_ID");
+  const auto selected_resolution=internal::SteamFrameEyeResolution(
+      std::string_view(bytes.data(), static_cast<std::size_t>(size)),
+      steam_id ? steam_id : "");
+  value.eye_resolution=selected_resolution ? selected_resolution : 2160;
+  if(!json.contains("nightcap") || !json["nightcap"].is_object())return value;
+  const auto& settings=json["nightcap"];
+  if(settings.contains("foveationLevel") && settings["foveationLevel"].is_number_integer()) {
+    const auto next=settings["foveationLevel"].get<std::int64_t>();
+    if(next>=0 && next<=3)value.foveation=static_cast<int>(next);
+  }
+  if(settings.contains("aaMode") && settings["aaMode"].is_number_integer()) {
+    const auto next=settings["aaMode"].get<std::int64_t>();
+    value.aa_mode=internal::NativeAntiAliasingMode(next);
+  }
+  if(settings.contains("gazeRadiusPercent") && settings["gazeRadiusPercent"].is_number()) {
+    const auto percent=settings["gazeRadiusPercent"].get<double>();
+    if(std::isfinite(percent))value.gaze_radius=internal::ClampGazeRadius(static_cast<float>(percent*.01));
+  }
+  return value;
+}
+VideoSettings ReadVideoSettings() {
+  static internal::AsyncSettings<VideoSettings> settings(
+      VideoSettings{}, ReadVideoSettingsFile, std::chrono::seconds(1));
+  return settings.Get();
+}
 using SynchronizedQueueSubmit = VkResult(VKAPI_PTR *)(PFN_vkQueueSubmit,
                                                       VkDevice, VkQueue,
                                                       std::uint32_t,
                                                       const VkSubmitInfo *,
                                                       VkFence);
 std::atomic<SynchronizedQueueSubmit> g_queue_submit_adapter{nullptr};
+using QueueOperation = std::int32_t (*)(void *);
+using SynchronizedQueueOperation = std::int32_t (*)(VkDevice, VkQueue,
+                                                   QueueOperation, void *);
+std::atomic<SynchronizedQueueOperation> g_queue_operation_adapter{nullptr};
+
+// Runtime begin/end/acquire/release calls may submit to the Vulkan binding's
+// queue. Share its host lock with guest submissions for the complete call.
+template <typename Call>
+XrResult CallXrQueue(VkDevice device, VkQueue queue, Call call) {
+  const auto synchronized =
+      g_queue_operation_adapter.load(std::memory_order_acquire);
+  if (!synchronized || !device || !queue) return call();
+  return static_cast<XrResult>(synchronized(
+      device, queue,
+      [](void *context) -> std::int32_t {
+        return static_cast<std::int32_t>((*static_cast<Call *>(context))());
+      }, &call));
+}
+
+std::atomic<void(*)(VkDevice,VkQueue)> g_pass_timing_reporter{nullptr};
 using SynchronizedDeviceIdle = VkResult(VKAPI_PTR *)(PFN_vkDeviceWaitIdle,
                                                      VkDevice);
 std::atomic<SynchronizedDeviceIdle> g_device_idle_adapter{nullptr};
@@ -113,6 +219,9 @@ std::string EnvString(const char* name, const char* fallback) {
 #ifndef MOCKTAIL_VR_DIAGNOSTICS
 #define MOCKTAIL_VR_DIAGNOSTICS 0
 #endif
+bool FoveationBenchmark() {
+  return MOCKTAIL_VR_DIAGNOSTICS && EnvString("MOCKTAIL_VR_FOVEATION_BENCHMARK", "0")=="1";
+}
 // Desktop/acceptance diagnostics (scripted head pose, eye evidence dumps)
 // exist only in builds configured with -DMOCKTAIL_VR_DIAGNOSTICS=ON; in
 // normal builds their environment variables have no effect. Read once: the
@@ -209,6 +318,8 @@ VkFormat SrgbSibling(VkFormat format) {
 }
 
 OpenXrBackend* g_backend = nullptr;
+std::atomic<bool> g_fsr3_inputs_available{false};
+std::atomic<bool> g_fsr3_capture_active{false};
 // Read by the Vulkan adapter through mocktail_vr_xr_queue_sharing_requested().
 std::atomic<bool> g_queue_sharing_requested{false};
 std::mutex g_backend_slot_mutex;
@@ -255,11 +366,7 @@ struct OpenXrBackend::VkProcs {
   PFN_vkGetPhysicalDeviceQueueFamilyProperties
       GetPhysicalDeviceQueueFamilyProperties = nullptr;
   PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
-  // FXAA and SMAA passes.
-  PFN_vkCreateImage CreateImage = nullptr;
-  PFN_vkDestroyImage DestroyImage = nullptr;
-  PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
-  PFN_vkBindImageMemory BindImageMemory = nullptr;
+  // FXAA pass.
   PFN_vkCreateShaderModule CreateShaderModule = nullptr;
   PFN_vkDestroyShaderModule DestroyShaderModule = nullptr;
   PFN_vkCreateRenderPass CreateRenderPass = nullptr;
@@ -339,6 +446,37 @@ void CheckXr(XrInstance instance, XrResult result, const char* operation) {
 }
 
 }  // namespace
+
+std::uint32_t internal::SteamFrameEyeResolution(
+    std::string_view settings, std::string_view steam_app_id) {
+  const auto json = nlohmann::json::parse(
+      settings.begin(), settings.end(), nullptr, false);
+  if (!json.is_object()) return 0;
+  const auto dimension = [&](const std::string& section) -> std::uint32_t {
+    const auto group = json.find(section);
+    if (group == json.end() || !group->is_object()) return 0;
+    const auto value = group->find("resolutionOverride");
+    if (value == group->end() || !value->is_number_integer()) return 0;
+    const auto pixels = value->get<std::int64_t>();
+    return pixels >= 128 && pixels <= 8192
+               ? static_cast<std::uint32_t>(pixels) : 0;
+  };
+  // Only a numeric Steam shortcut ID may select the per-application section.
+  const bool valid_id = !steam_app_id.empty() && steam_app_id.size() <= 10 &&
+      std::all_of(steam_app_id.begin(), steam_app_id.end(),
+                  [](char c) { return c >= '0' && c <= '9'; }) &&
+      std::stoull(std::string(steam_app_id)) > 0 &&
+      std::stoull(std::string(steam_app_id)) <= UINT32_MAX;
+  if (valid_id) {
+    if (const auto pixels = dimension("steam.app." + std::string(steam_app_id)))
+      return pixels;
+  }
+  if (const auto pixels = dimension("io.github.CoderDayton.nightcap.vr"))
+    return pixels;
+  if (const auto pixels = dimension("io.github.coderdayton.nightcap.vr"))
+    return pixels;
+  return dimension("steamvr");
+}
 
 OpenXrBackend::~OpenXrBackend() { Disarm(); }
 
@@ -442,9 +580,22 @@ bool OpenXrBackend::EnsureXrInstanceLocked(std::string* error) {
         extensions.push_back(optional);
       }
     }
+    const char* foveation_extensions[] = {
+      XR_FB_FOVEATION_EXTENSION_NAME, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME,
+      XR_FB_FOVEATION_VULKAN_EXTENSION_NAME, XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME,
+      XR_META_FOVEATION_EYE_TRACKED_EXTENSION_NAME};
+    eye_gaze_available_=std::any_of(available.begin(),available.end(),[](const auto& extension){return std::strcmp(extension.extensionName,XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)==0;});
+    if(eye_gaze_available_)extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+    foveation_runtime_available_ = graphics_api_ == VrGraphicsApi::kVulkan &&
+        EnvString("MOCKTAIL_VR_FOVEATION", "0") == "1" &&
+        std::all_of(std::begin(foveation_extensions), std::end(foveation_extensions),
+          [&](const char* name) { return std::any_of(available.begin(), available.end(),
+            [&](const auto& entry) { return std::strcmp(entry.extensionName, name) == 0; }); });
+    if (foveation_runtime_available_)
+      extensions.insert(extensions.end(), std::begin(foveation_extensions), std::end(foveation_extensions));
     auto info = XrInfo<XrInstanceCreateInfo>(XR_TYPE_INSTANCE_CREATE_INFO);
-    std::strcpy(info.applicationInfo.applicationName, "Mocktail Roblox VR");
-    std::strcpy(info.applicationInfo.engineName, "Mocktail");
+    std::strcpy(info.applicationInfo.applicationName, "Nightcap Roblox VR");
+    std::strcpy(info.applicationInfo.engineName, "Nightcap");
     info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 1, 0);
     info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
     info.enabledExtensionNames = extensions.data();
@@ -530,7 +681,7 @@ bool OpenXrBackend::EnsureXrInstanceLocked(std::string* error) {
     // session (including a recreated one) can attach without re-suggesting
     // bindings. A failure degrades to no controller input, not to no XR.
     std::lock_guard<std::mutex> controller_lock(controller_mutex_);
-    const Status actions_status = actions_.Create(instance);
+    const Status actions_status = actions_.Create(instance,eye_gaze_available_);
     actions_created_ = actions_status.ok();
     if (!actions_created_) {
       Log("  [vr-backend] controller actions unavailable: %s (XR output "
@@ -615,6 +766,7 @@ Status OpenXrBackend::Arm(VrGraphicsApi graphics_api) {
       throw std::runtime_error(err);
     }
     armed_.store(true, std::memory_order_release);
+
     // From here the runtime and the eye copies share the guest's queue, so
     // the Vulkan adapter must serialize queue calls. Armed before Roblox
     // creates its device, so no queue call ever started unlocked.
@@ -638,6 +790,11 @@ void OpenXrBackend::Disarm() {
 }
 
 void OpenXrBackend::DisarmLocked() {
+  // The adapter already released its guest bookkeeping for a retained device.
+  // Destroy it only after every XR-owned child has been released.
+  const VkDevice retained_device = vk_device_retained_ ? vk_device_ : VK_NULL_HANDLE;
+  auto destroy_device = retained_device && vk_ ?
+      reinterpret_cast<PFN_vkDestroyDevice>(vk_->get_device_proc_addr(retained_device, "vkDestroyDevice")) : nullptr;
   TeardownSessionLocked("disarm");
   DestroyXrInstanceLocked();
   if (gles_)
@@ -645,8 +802,25 @@ void OpenXrBackend::DisarmLocked() {
   delete gles_;
   gles_ = nullptr;
   runtime_name_.clear();
+  if (destroy_device) destroy_device(retained_device, nullptr);
+  vk_device_retained_ = false;
+  guest_device_key_.clear();
+  if (vk_instance_retained_ && vk_instance_ != VK_NULL_HANDLE && vk_loader_ != nullptr) {
+    auto get = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(vk_loader_, "vkGetInstanceProcAddr"));
+    auto destroy = get ? reinterpret_cast<PFN_vkDestroyInstance>(get(vk_instance_, "vkDestroyInstance")) : nullptr;
+    if (destroy) destroy(vk_instance_, nullptr);
+  }
+  vk_instance_retained_ = false;
+  guest_instance_key_.clear();
+  guest_device_generation_ = 0;
+  defer_initial_session_ = false;
   vk_instance_ = VK_NULL_HANDLE;
+  vk_instance_api_version_=VK_API_VERSION_1_0;
+  fsr3_device_supported_=false;
   if (vk_loader_ != nullptr) {
+#ifdef MOCKTAIL_ENABLE_FSR3
+    ScopedFsr3VulkanDeviceCreate::ClearFallback();
+#endif
     dlclose(vk_loader_);
     vk_loader_ = nullptr;
   }
@@ -658,6 +832,8 @@ void OpenXrBackend::DisarmLocked() {
   {
     std::lock_guard<std::mutex> slot_lock(g_backend_slot_mutex);
     if (g_backend == this) {
+      g_fsr3_capture_active.store(false,std::memory_order_release);
+      g_fsr3_inputs_available.store(false,std::memory_order_release);
       g_backend = nullptr;
     }
   }
@@ -681,6 +857,27 @@ void* OpenXrBackend::ResolveFunction(const char* name) const {
   return reinterpret_cast<void*>(function);
 }
 
+namespace {
+std::string VulkanInstanceKey(const VkInstanceCreateInfo* info) {
+  if (info == nullptr || info->pNext != nullptr ||
+      (info->pApplicationInfo != nullptr && info->pApplicationInfo->pNext != nullptr)) return {};
+  std::string key = std::to_string(info->flags) + ":" +
+      std::to_string(info->pApplicationInfo ? info->pApplicationInfo->apiVersion : 0);
+  for (auto names : {std::pair{info->enabledExtensionCount, info->ppEnabledExtensionNames},
+                     std::pair{info->enabledLayerCount, info->ppEnabledLayerNames}}) {
+    std::vector<std::string> sorted;
+    for (std::uint32_t i=0; i<names.first; ++i) {
+      if (names.second == nullptr || names.second[i] == nullptr) return {};
+      sorted.emplace_back(names.second[i]);
+    }
+    std::sort(sorted.begin(), sorted.end());
+    key += "|";
+    for (const auto& name : sorted) key += std::to_string(name.size()) + ":" + name;
+  }
+  return key;
+}
+} // namespace
+
 bool OpenXrBackend::CreateVulkanInstance(
     const VkInstanceCreateInfo* create_info,
     const VkAllocationCallbacks* allocator, VkInstance* instance,
@@ -692,6 +889,20 @@ bool OpenXrBackend::CreateVulkanInstance(
     return false;
   }
   try {
+    const auto request_key = allocator == nullptr ? VulkanInstanceKey(create_info) : std::string{};
+    if (vk_instance_retained_) {
+      if (request_key.empty() || request_key != guest_instance_key_) {
+        Log("  [vr-backend] retained ARM SteamVR instance cannot satisfy changed Vulkan creation requirements\n");
+        *instance = VK_NULL_HANDLE;
+        *result = VK_ERROR_INITIALIZATION_FAILED;
+        return true;
+      }
+      vk_instance_retained_ = false;
+      *instance = vk_instance_;
+      *result = VK_SUCCESS;
+      Log("  [vr-backend] reused compatible native Vulkan instance for renderer transition\n");
+      return true;
+    }
     if (xr_instance_used_ || vk_instance_ != VK_NULL_HANDLE ||
         xr_session_ != nullptr) {
       TeardownSessionLocked("recycling OpenXR instance for new Vulkan instance");
@@ -728,6 +939,9 @@ bool OpenXrBackend::CreateVulkanInstance(
       return true;
     }
     vk_instance_ = created;
+    vk_instance_api_version_=create_info->pApplicationInfo && create_info->pApplicationInfo->apiVersion
+        ? create_info->pApplicationInfo->apiVersion:VK_API_VERSION_1_0;
+    guest_instance_key_ = request_key;
     xr_instance_used_ = true;
     *instance = created;
     *result = VK_SUCCESS;
@@ -739,6 +953,76 @@ bool OpenXrBackend::CreateVulkanInstance(
         error.what());
     return false;
   }
+}
+
+std::string OpenXrBackend::VulkanDeviceKey(const VkDeviceCreateInfo* info) {
+  if (!info || info->queueCreateInfoCount == 0 ||
+      info->queueCreateInfoCount > 256 || !info->pQueueCreateInfos) return {};
+  std::string key = std::to_string(info->flags);
+  auto append = [&](const void* values, std::size_t size) {
+    key += ":" + std::to_string(size) + ":";
+    key.append(static_cast<const char*>(values), size);
+  };
+  const VkPhysicalDeviceFeatures empty{};
+  append(info->pEnabledFeatures ? info->pEnabledFeatures : &empty, sizeof(empty));
+  for (auto names : {std::pair{info->enabledExtensionCount, info->ppEnabledExtensionNames},
+                     std::pair{info->enabledLayerCount, info->ppEnabledLayerNames}}) {
+    if (names.first > 4096) return {};
+    std::vector<std::string> sorted;
+    for (std::uint32_t i = 0; i < names.first; ++i) {
+      if (!names.second || !names.second[i]) return {};
+      sorted.emplace_back(names.second[i]);
+    }
+    std::sort(sorted.begin(), sorted.end());
+    key += "|";
+    for (const auto& name : sorted) key += std::to_string(name.size()) + ":" + name;
+  }
+  key += "|queues";
+  for (std::uint32_t i = 0; i < info->queueCreateInfoCount; ++i) {
+    const auto& q = info->pQueueCreateInfos[i];
+    if (q.pNext || !q.pQueuePriorities || !q.queueCount || q.queueCount > 256) return {};
+    key += ":" + std::to_string(q.flags) + ":" + std::to_string(q.queueFamilyIndex) +
+           ":" + std::to_string(q.queueCount);
+    append(q.pQueuePriorities, q.queueCount * sizeof(float));
+  }
+  // Only fixed, known feature records may be compared. Exclude headers,
+  // pointers and tail padding; unknown extension contracts fail closed.
+  std::vector<std::pair<int, std::string>> features;
+  auto p = static_cast<const VkBaseInStructure*>(info->pNext);
+  for (unsigned count = 0; p; ++count, p = p->pNext) {
+    if (count == 32) return {};
+    const char* begin = nullptr;
+    std::size_t bytes = 0;
+#define FEATURE_RANGE(tag, type, first, last) \
+    case tag: begin = reinterpret_cast<const char*>(p) + offsetof(type, first); \
+      bytes = offsetof(type, last) + sizeof(VkBool32) - offsetof(type, first); break;
+    switch (p->sType) {
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, VkPhysicalDeviceFeatures2, features, features)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features, storageBuffer16BitAccess, shaderDrawParameters)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge, subgroupBroadcastDynamicId)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, VkPhysicalDeviceVulkan13Features, robustImageAccess, maintenance4)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, VkPhysicalDeviceTimelineSemaphoreFeatures, timelineSemaphore, timelineSemaphore)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, VkPhysicalDeviceHostQueryResetFeatures, hostQueryReset, hostQueryReset)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, VkPhysicalDeviceDynamicRenderingFeatures, dynamicRendering, dynamicRendering)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, VkPhysicalDeviceSynchronization2Features, synchronization2, synchronization2)
+      FEATURE_RANGE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, VkPhysicalDeviceSamplerYcbcrConversionFeatures, samplerYcbcrConversion, samplerYcbcrConversion)
+      default:
+        Log("  [vr-backend] Vulkan device retention unavailable for feature type %d\n", static_cast<int>(p->sType));
+        for (auto scan = p; scan && count < 32; scan = scan->pNext, ++count)
+          Log("  [vr-backend] remaining Vulkan feature type %d\n", static_cast<int>(scan->sType));
+        return {};
+    }
+#undef FEATURE_RANGE
+    if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) bytes = sizeof(VkPhysicalDeviceFeatures);
+    features.emplace_back(static_cast<int>(p->sType), std::string(begin, bytes));
+  }
+  std::sort(features.begin(), features.end());
+  for (std::size_t i = 0; i < features.size(); ++i) {
+    if (i && features[i-1].first == features[i].first) return {};
+    key += ":feature:" + std::to_string(features[i].first);
+    append(features[i].second.data(), features[i].second.size());
+  }
+  return key;
 }
 
 bool OpenXrBackend::CreateVulkanDevice(VkPhysicalDevice physical_device,
@@ -753,6 +1037,22 @@ bool OpenXrBackend::CreateVulkanDevice(VkPhysicalDevice physical_device,
     return false;
   }
   try {
+    const auto request_key = allocator == nullptr ? VulkanDeviceKey(create_info) : std::string{};
+    if (vk_device_retained_) {
+      if (physical_device != vk_physical_device_ || request_key.empty() ||
+          request_key != guest_device_key_) {
+        Log("  [vr-backend] retained live VR session cannot satisfy changed Vulkan device requirements\n");
+        *device = VK_NULL_HANDLE;
+        *result = VK_ERROR_INITIALIZATION_FAILED;
+        return true;
+      }
+      vk_device_retained_ = false;
+      recording_.store(true, std::memory_order_release);
+      *device = vk_device_;
+      *result = VK_SUCCESS;
+      Log("  [vr-backend] reused compatible Vulkan device and live XR session for renderer transition\n");
+      return true;
+    }
     auto loader_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         dlsym(vk_loader_, "vkGetInstanceProcAddr"));
     Require(loader_gipa != nullptr, "Host vkGetInstanceProcAddr is missing");
@@ -799,7 +1099,113 @@ bool OpenXrBackend::CreateVulkanDevice(VkPhysicalDevice physical_device,
     xr_info.systemId = xr_system_;
     xr_info.pfnGetInstanceProcAddr = loader_gipa;
     xr_info.vulkanPhysicalDevice = physical_device;
-    xr_info.vulkanCreateInfo = create_info;
+    VkDeviceCreateInfo foveated_info = *create_info;
+    VkPhysicalDeviceFragmentDensityMapFeaturesEXT density{};
+    density.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT;
+    VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{};
+    host_copy.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
+    density.pNext=&host_copy;
+    std::vector<const char*> enabled_extensions;
+    foveation_device_enabled_ = false;
+    foveation_host_copy_enabled_ = false;
+    if (foveation_runtime_available_) {
+      auto get_features = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+          loader_gipa(vk_instance_, "vkGetPhysicalDeviceFeatures2"));
+      auto enumerate_extensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+          loader_gipa(vk_instance_, "vkEnumerateDeviceExtensionProperties"));
+      VkPhysicalDeviceFeatures2 features{};
+      features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+      features.pNext = &density;
+      if (get_features) get_features(physical_device, &features);
+      std::uint32_t count = 0;
+      if (enumerate_extensions) enumerate_extensions(physical_device, nullptr, &count, nullptr);
+      std::vector<VkExtensionProperties> available(count <= 4096 ? count : 0);
+      if (!available.empty()) enumerate_extensions(physical_device, nullptr, &count, available.data());
+      const bool extension_available = std::any_of(available.begin(), available.end(),
+          [](const auto& entry) { return std::strcmp(entry.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) == 0; });
+      if (density.fragmentDensityMap && density.fragmentDensityMapNonSubsampledImages && extension_available) {
+        density.fragmentDensityMapDynamic = VK_FALSE;
+        density.pNext = const_cast<void*>(create_info->pNext);
+        foveated_info.pNext = &density;
+        for (std::uint32_t i = 0; i < create_info->enabledExtensionCount; ++i)
+          enabled_extensions.push_back(create_info->ppEnabledExtensionNames[i]);
+        if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(), [](const char* name) {
+              return std::strcmp(name, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) == 0; }))
+          enabled_extensions.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+        const char* host_extensions[]={VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME};
+        bool host_available=host_copy.hostImageCopy==VK_TRUE;
+        for(const char* name:host_extensions)host_available&=std::any_of(available.begin(),available.end(),[&](const auto& item){return std::strcmp(item.extensionName,name)==0;});
+        auto properties_of=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(loader_gipa(vk_instance_,"vkGetPhysicalDeviceProperties2"));
+        if(host_available && properties_of) {
+          VkPhysicalDeviceHostImageCopyPropertiesEXT host{};host.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
+          VkPhysicalDeviceProperties2 properties{};properties.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;properties.pNext=&host;
+          properties_of(physical_device,&properties);
+          if(host.copyDstLayoutCount>0 && host.copyDstLayoutCount<=128) {
+            std::vector<VkImageLayout> layouts(host.copyDstLayoutCount);host.pCopyDstLayouts=layouts.data();properties_of(physical_device,&properties);
+            host_available=std::find(layouts.begin(),layouts.end(),VK_IMAGE_LAYOUT_GENERAL)!=layouts.end();
+          } else host_available=false;
+        } else host_available=false;
+        if(host_available) {
+          host_copy.pNext=const_cast<void*>(create_info->pNext);density.pNext=&host_copy;
+          for(const char* name:host_extensions)if(std::none_of(enabled_extensions.begin(),enabled_extensions.end(),[&](const char* item){return std::strcmp(name,item)==0;}))enabled_extensions.push_back(name);
+          foveation_host_copy_enabled_=true;
+          Log("  [vr-foveation] host image copy enabled; gaze maps need no GPU upload waits\n");
+        }
+        foveated_info.enabledExtensionCount = static_cast<std::uint32_t>(enabled_extensions.size());
+        foveated_info.ppEnabledExtensionNames = enabled_extensions.data();
+        foveation_device_enabled_ = true;
+        Log("  [vr-foveation] enabled non-subsampled Vulkan fragment-density maps\n");
+      } else {
+        Log("  [vr-foveation] required Vulkan density-map features unavailable; full-detail rendering\n");
+      }
+    }
+    xr_info.vulkanCreateInfo = foveation_device_enabled_ ? &foveated_info : create_info;
+#ifdef MOCKTAIL_ENABLE_FSR3
+    Fsr3DeviceFeatureSupport fsr3_support;
+    auto get_fsr3_features=reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        loader_gipa(vk_instance_,"vkGetPhysicalDeviceFeatures2"));
+    if(!get_fsr3_features)get_fsr3_features=reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        loader_gipa(vk_instance_,"vkGetPhysicalDeviceFeatures2KHR"));
+    auto get_fsr3_properties=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        loader_gipa(vk_instance_,"vkGetPhysicalDeviceProperties"));
+    auto enumerate_fsr3_extensions=reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        loader_gipa(vk_instance_,"vkEnumerateDeviceExtensionProperties"));
+    VkPhysicalDeviceProperties fsr3_properties{};
+    if(get_fsr3_properties)get_fsr3_properties(physical_device,&fsr3_properties);
+    fsr3_support.api_version=std::min(vk_instance_api_version_,fsr3_properties.apiVersion);
+    std::uint32_t fsr3_extension_count=0;
+    if(enumerate_fsr3_extensions &&
+       enumerate_fsr3_extensions(physical_device,nullptr,&fsr3_extension_count,nullptr)==VK_SUCCESS &&
+       fsr3_extension_count<=4096) {
+      std::vector<VkExtensionProperties> available(fsr3_extension_count);
+      if(enumerate_fsr3_extensions(physical_device,nullptr,&fsr3_extension_count,available.data())==VK_SUCCESS)
+        fsr3_support.float16_extension_available=std::any_of(available.begin(),available.end(),
+            [](const auto& item){return std::strcmp(item.extensionName,VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)==0;});
+    }
+    if(get_fsr3_features) {
+      VkPhysicalDeviceShaderFloat16Int8Features half{};
+      half.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+      VkPhysicalDeviceFeatures2 features{};features.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+      if(fsr3_support.api_version>=VK_API_VERSION_1_2 || fsr3_support.float16_extension_available)
+        features.pNext=&half;
+      get_fsr3_features(physical_device,&features);
+      fsr3_support.shader_float16=half.shaderFloat16==VK_TRUE;
+      fsr3_support.shader_int16=features.features.shaderInt16==VK_TRUE;
+      fsr3_support.shader_storage_image_extended_formats=features.features.shaderStorageImageExtendedFormats==VK_TRUE;
+      fsr3_support.shader_storage_image_write_without_format=features.features.shaderStorageImageWriteWithoutFormat==VK_TRUE;
+    }
+    // Enable supported shader features once so live upscaling changes do not
+    // require a new Vulkan device. FP32 remains the upscaler's quality default.
+    Fsr3DeviceFeatures fsr3_features(*xr_info.vulkanCreateInfo,fsr3_support);
+    xr_info.vulkanCreateInfo=&fsr3_features.create_info();
+    fsr3_device_supported_=fsr3_features.fp16_enabled() &&
+        fsr3_support.shader_storage_image_extended_formats &&
+        fsr3_support.shader_storage_image_write_without_format;
+    Log("  [vr-fsr3] logical device shader support=%d (%s)\n",
+        fsr3_device_supported_,fsr3_features.reason());
+    ScopedFsr3VulkanDeviceCreate fsr3_runtime_device(loader_gipa,vk_instance_);
+    xr_info.pfnGetInstanceProcAddr=fsr3_runtime_device.get_instance_proc_addr();
+#endif
     VkDevice created = VK_NULL_HANDLE;
     VkResult vk_result = VK_ERROR_INITIALIZATION_FAILED;
     CheckXr(static_cast<XrInstance>(xr_instance_),
@@ -813,6 +1219,7 @@ bool OpenXrBackend::CreateVulkanDevice(VkPhysicalDevice physical_device,
     }
     *device = created;
     *result = VK_SUCCESS;
+    guest_device_key_ = request_key;
     // From here the runtime-created device is the guest device; never fall
     // back to a second plain vkCreateDevice. Session setup failures degrade
     // to the native-stereo diagnostic path with an explicit log.
@@ -837,6 +1244,9 @@ void OpenXrBackend::SetupDeviceAfterCreationLocked(
     const VkDeviceCreateInfo *create_info) {
   vk_device_ = created;
   vk_physical_device_ = physical_device;
+  ++guest_device_generation_;
+  defer_initial_session_ = guest_device_generation_ == 1 &&
+      EnvString("MOCKTAIL_VR_DEFER_INITIAL_SESSION", "0") == "1";
   auto loader_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
       dlsym(vk_loader_, "vkGetInstanceProcAddr"));
   Require(loader_gipa != nullptr, "Host vkGetInstanceProcAddr is missing");
@@ -908,10 +1318,6 @@ void OpenXrBackend::SetupDeviceAfterCreationLocked(
   MOCKTAIL_BACKEND_VK_FN(CmdSetViewport)
   MOCKTAIL_BACKEND_VK_FN(CmdSetScissor)
   MOCKTAIL_BACKEND_VK_FN(CmdDraw)
-  MOCKTAIL_BACKEND_VK_FN(CreateImage)
-  MOCKTAIL_BACKEND_VK_FN(DestroyImage)
-  MOCKTAIL_BACKEND_VK_FN(GetImageMemoryRequirements)
-  MOCKTAIL_BACKEND_VK_FN(BindImageMemory)
 #undef MOCKTAIL_BACKEND_VK_FN
 #define MOCKTAIL_BACKEND_VK_INSTANCE_FN(name)                                  \
   vk_->name =                                                                  \
@@ -934,6 +1340,7 @@ void OpenXrBackend::SetupDeviceAfterCreationLocked(
           device_properties.deviceName, error.c_str());
       return;
     }
+    if (defer_initial_session_) return;
     Log("  [vr-backend] XR session bound to guest VkDevice: gpu=%s runtime=%s "
         "pose_source=%s\n",
         device_properties.deviceName, runtime_name_.c_str(),
@@ -973,6 +1380,7 @@ bool OpenXrBackend::InitializeSessionLocked(
             "the guest device requested no graphics queue family");
     vk_queue_family_ = chosen_family;
     if (create_info) {
+      single_guest_queue_ = internal::SingleUnprotectedVulkanQueue(create_info);
       device_queue_families_.clear();
       for (std::uint32_t i = 0; i < create_info->queueCreateInfoCount; ++i) {
         const auto &requested = create_info->pQueueCreateInfos[i];
@@ -988,6 +1396,13 @@ bool OpenXrBackend::InitializeSessionLocked(
             "missing guest graphics queue");
     queue_families_[vk_graphics_queue_] = chosen_family;
 
+    if (defer_initial_session_) {
+      // The native eye mirror can render the desktop menu without an XR
+      // session. Keep its queue/resource provenance and copy path active.
+      recording_.store(true, std::memory_order_release);
+      Log("  [vr-backend] desktop launcher: mirror active, first XR session deferred until the next guest renderer\n");
+      return true;
+    }
     auto binding = XrInfo<XrGraphicsBindingVulkan2KHR>(
         XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR);
     binding.instance = vk_instance_;
@@ -1246,6 +1661,23 @@ bool OpenXrBackend::InitializeSessionResourcesLocked(std::string *error) {
     // Per-axis scale on the runtime's recommendation. The swapchains, the
     // guest eye framebuffers and the submitted image rect all derive from
     // these extents, so Roblox renders at the scaled size end to end.
+    for (int eye=0;eye<2;++eye) {
+      xr_max_eye_width_[eye]=config_views[eye].maxImageRectWidth;
+      xr_max_eye_height_[eye]=config_views[eye].maxImageRectHeight;
+    }
+    const auto video_settings=ReadVideoSettings();
+    if(runtime_name_ == "SteamVR/OpenXR" && video_settings.eye_resolution) {
+      for(int eye=0;eye<2;++eye) {
+        const double aspect=double(xr_eye_height_[eye])/xr_eye_width_[eye];
+        xr_eye_width_[eye]=std::min(video_settings.eye_resolution,
+            config_views[eye].maxImageRectWidth ? config_views[eye].maxImageRectWidth : UINT32_MAX);
+        xr_eye_height_[eye]=std::clamp<std::uint32_t>(
+            static_cast<std::uint32_t>(std::lround(xr_eye_width_[eye]*aspect)),1,
+            config_views[eye].maxImageRectHeight ? config_views[eye].maxImageRectHeight : UINT32_MAX);
+      }
+      Log("  [vr-backend] Steam Video resolution: eye extents L=%ux%u R=%ux%u\n",
+          xr_eye_width_[0],xr_eye_height_[0],xr_eye_width_[1],xr_eye_height_[1]);
+    }
     double render_scale = EnvDouble("MOCKTAIL_VR_RENDER_SCALE", 1.0);
     if (!std::isfinite(render_scale) || render_scale <= 0.0) {
       render_scale = 1.0;
@@ -1280,6 +1712,14 @@ bool OpenXrBackend::InitializeSessionResourcesLocked(std::string *error) {
     if (!CreateSwapchains(error)) {
       TeardownSessionLocked("swapchain failure", session_recovery_pending_);
       return false;
+    }
+    if (foveation_device_enabled_) {
+      const auto foveation_status = foveation_.Initialize(xr_instance_, xr_system_, xr_session_,
+          vk_device_, vk_->get_device_proc_addr,
+          std::max(xr_eye_width_[0], xr_eye_width_[1]),
+          std::max(xr_eye_height_[0], xr_eye_height_[1]), eye_swapchains_[0].format);
+      if (!foveation_status.ok())
+        Log("  [vr-foveation] disabled: %s\n", foveation_status.message().c_str());
     }
     // Attach the action set to this session and create its pose spaces. A
     // failure leaves XR output working without controller input.
@@ -1352,7 +1792,7 @@ bool OpenXrBackend::CreateSwapchains(std::string* error) {
           XrInfo<XrSwapchainCreateInfo>(XR_TYPE_SWAPCHAIN_CREATE_INFO);
       create_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
                                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-      if (!EvidenceDirectory().empty())
+      if (upscale_mode_ > 0 || !EvidenceDirectory().empty())
         create_info.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
       create_info.format = static_cast<std::int64_t>(chosen);
       create_info.sampleCount = 1;
@@ -1451,6 +1891,10 @@ void OpenXrBackend::MatchSwapchainFormatToEyesLocked() {
 }
 
 void OpenXrBackend::DestroySwapchains() {
+  WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
+  gaze_aa_.Reset();
+  fsr_.Reset();
+  ResetFsr3Locked();
   DestroyFxaaTargetsLocked();  // views of these images
   for (EyeSwapchain& slot : eye_swapchains_) {
     slot.images.clear();
@@ -1465,13 +1909,21 @@ void OpenXrBackend::DestroySwapchains() {
 }
 
 void OpenXrBackend::TeardownSessionLocked(const char* reason, bool preserve_device) {
+  // The desktop mirror allocates command buffers even before an XR session.
+  // Release them while their guest VkDevice and dispatch table are still live.
+  if (xr_session_ == nullptr && vk_ && vk_device_ != VK_NULL_HANDLE) {
+    (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
+    DestroyCopyResources();
+  }
   if (xr_session_ != nullptr) {
     const auto session = static_cast<XrSession>(xr_session_);
     if (frame_open_) {
       auto end = XrInfo<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
       end.displayTime = frame_display_time_;
       end.environmentBlendMode = static_cast<XrEnvironmentBlendMode>(xr_blend_mode_);
-      (void)xrEndFrame(session, &end);
+      (void)CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+        return xrEndFrame(session, &end);
+      });
       frame_open_ = false;
     }
     // Destruction also ends a running session; xrEndSession is legal only in
@@ -1482,6 +1934,8 @@ void OpenXrBackend::TeardownSessionLocked(const char* reason, bool preserve_devi
       mirror_.DestroyStaging(MirrorProcs());
     }
     mirror_.Close();
+    foveation_.Destroy();
+    foveation_used_in_frame_ = false;
     DestroyVirtualKeyboardResources();
     DestroyCopyResources();
     DestroySwapchains();
@@ -1552,6 +2006,7 @@ void OpenXrBackend::TeardownSessionLocked(const char* reason, bool preserve_devi
   queue_families_.clear();
   vk_graphics_queue_ = VK_NULL_HANDLE;
   device_queue_families_.clear();
+  single_guest_queue_ = false;
   command_pool_families_.clear();
   command_records_.clear();
   eye_render_queues_.clear();
@@ -1560,26 +2015,249 @@ void OpenXrBackend::TeardownSessionLocked(const char* reason, bool preserve_devi
   vk_ = nullptr;
 }
 
-void OpenXrBackend::NoteInstanceDestroyed(VkInstance instance) {
+bool OpenXrBackend::NoteInstanceDestroyed(VkInstance instance) {
   // Lock order: frame_mutex_, then mutex_ (see NoteHostPresent).
   std::lock_guard<std::mutex> frame(frame_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (instance == vk_instance_) {
-    TeardownSessionLocked("guest VkInstance destroyed");
+    if (!vk_device_retained_) TeardownSessionLocked("guest VkInstance destroyed");
+#if defined(__aarch64__)
+    if (runtime_name_ == "SteamVR/OpenXR" && !guest_instance_key_.empty()) {
+      // Native SteamVR can query a stale VkInstance after recreation. Retain
+      // the compatible native instance and XR connection until process teardown.
+      vk_instance_retained_ = true;
+      Log("  [vr-backend] retaining native Vulkan instance for ARM SteamVR renderer transition\n");
+      return true;
+    }
+#endif
     DestroyXrInstanceLocked();
+    guest_instance_key_.clear();
     vk_instance_ = VK_NULL_HANDLE;
   }
+  return false;
 }
 
-void OpenXrBackend::NoteDeviceDestroyed(VkDevice device) {
+void OpenXrBackend::ReleaseGuestRendererLocked() {
+  // Keep the XR session, spaces, actions and runtime swapchains alive. All
+  // guest-owned images and command records belong to the old renderer.
+  if (frame_open_) {
+    auto end = XrInfo<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
+    end.displayTime = frame_display_time_;
+    end.environmentBlendMode = static_cast<XrEnvironmentBlendMode>(xr_blend_mode_);
+    (void)CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+      return xrEndFrame(static_cast<XrSession>(xr_session_), &end);
+    });
+    frame_open_ = false;
+  }
+  (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
+  mirror_.DestroyStaging(MirrorProcs());
+  foveation_.EndFrame();
+  foveation_used_in_frame_ = false;
+  DestroyCopyResources();
+  recording_.store(false, std::memory_order_release);
+  eyes_bound_.store(false, std::memory_order_release);
+  frame_views_valid_ = false;
+  published_pose_.valid = false;
+  eyes_[0] = {};
+  eyes_[1] = {};
+  applied_poses_.clear();
+  images_.clear();
+  desktop_swapchains_.clear();
+  image_views_.clear();
+  framebuffer_views_.clear();
+  framebuffer_render_pass_.clear();
+  render_pass_final_layouts_.clear();
+  command_pool_families_.clear();
+  command_records_.clear();
+  eye_render_queues_.clear();
+  eye_render_frames_.clear();
+  eye_format_checked_ = VK_FORMAT_UNDEFINED;
+}
+
+bool OpenXrBackend::NoteDeviceDestroyed(VkDevice device) {
   // Lock order: frame_mutex_, then mutex_ (see NoteHostPresent).
   std::lock_guard<std::mutex> frame(frame_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (device != VK_NULL_HANDLE && device == vk_device_) {
+#if defined(__aarch64__)
+    if (runtime_name_ == "SteamVR/OpenXR" && xr_session_ &&
+        !guest_instance_key_.empty() && !guest_device_key_.empty()) {
+      ReleaseGuestRendererLocked();
+      vk_device_retained_ = true;
+      Log("  [vr-backend] retaining Vulkan device and live XR session for ARM renderer transition\n");
+      return true;
+    }
+#endif
     // Tear down while the device is still valid; the adapter notifies before
     // the host destroy call.
     TeardownSessionLocked("guest VkDevice destroyed");
   }
+  return false;
+}
+
+bool OpenXrBackend::FoveationEnabled(VkDevice device) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return device == vk_device_ && foveation_device_enabled_ && foveation_.ready();
+}
+VkExtent2D OpenXrBackend::FoveationMapExtent(VkDevice device) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return device == vk_device_ && foveation_.ready()
+      ? VkExtent2D{foveation_.width(), foveation_.height()} : VkExtent2D{};
+}
+VkImageView OpenXrBackend::FoveationViewForFramebuffer(VkDevice device, VkFramebuffer framebuffer) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (device != vk_device_ || !foveation_.tracking()) return VK_NULL_HANDLE;
+  for (unsigned eye = 0; eye < 2; ++eye)
+    if (eyes_[eye].valid && eyes_[eye].framebuffer == framebuffer) {
+      const auto view = foveation_.view(eye);
+      foveation_used_in_frame_ |= view != VK_NULL_HANDLE;
+      return view;
+    }
+  return VK_NULL_HANDLE;
+}
+bool OpenXrBackend::FoveationFocus(VkDevice device,VkFramebuffer framebuffer,float* x,float* y,std::uint64_t* frame,int* eye,int* level) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!x || !y || !eye)return false;
+  int index=-1;
+  for(int i=0;i<2;++i)if(eyes_[i].valid && eyes_[i].framebuffer==framebuffer)index=i;
+  if(index<0)return false;
+  float centers[4]{},radius=0;
+  if(!FoveationSnapshotLocked(device,centers,&radius,frame,level))return false;
+  *x=centers[index*2];*y=centers[index*2+1];*eye=index;return true;
+}
+int OpenXrBackend::FoveationSceneEyeLocked(VkDevice device,
+    std::uint32_t width, std::uint32_t height) const {
+  void* owner=nullptr;void* guest_framebuffer=nullptr;int eye=-1;
+  if(device!=vk_device_ || !width || !height || !eyes_bound_.load(std::memory_order_acquire) ||
+      !mocktail_vr_current_eye(&owner,&eye,&guest_framebuffer) ||
+      !owner || !guest_framebuffer || eye<0 || eye>1)return -1;
+  const auto& binding=eyes_[eye];
+  // A previous frame's output establishes the identity of the intermediate
+  // rendered before it. Reject stale generations and mismatched eye getters.
+  if(!binding.valid || binding.owner!=owner || binding.guest_framebuffer!=guest_framebuffer ||
+      binding.width!=width || binding.height!=height ||
+      binding.frame>published_pose_.frame || published_pose_.frame-binding.frame>1)return -1;
+  return eye;
+}
+bool OpenXrBackend::FoveationRenderFocus(VkDevice device,VkFramebuffer framebuffer,
+    std::uint32_t width,std::uint32_t height,float* x,float* y,float* radius,
+    std::uint64_t* frame,int* eye,int* level) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!x || !y || !radius || !eye)return false;
+  int index=-1;
+  for(int i=0;i<2;++i)if(eyes_[i].valid && eyes_[i].framebuffer==framebuffer)index=i;
+  if(index<0)index=FoveationSceneEyeLocked(device,width,height);
+  if(index<0)return false;
+  float centers[4]{};
+  if(!FoveationSnapshotLocked(device,centers,radius,frame,level))return false;
+  *x=centers[index*2];*y=centers[index*2+1];*eye=index;return true;
+}
+bool OpenXrBackend::Fsr3InputsAvailable() const {
+  return false;
+}
+bool OpenXrBackend::Fsr3InputsEnabled() const {
+  return false;
+}
+void OpenXrBackend::ResetFsr3Locked() {
+  // Unlike final eye copies, a depth snapshot is written by a guest command
+  // buffer. Drain that queue as well before destroying/replacing its storage.
+  if(fsr3_has_resources_ && vk_ && vk_device_)
+    (void)IdleHostDevice(vk_->DeviceWaitIdle,vk_device_);
+#ifdef MOCKTAIL_ENABLE_FSR3
+  fsr3_.Reset();fsr3_transport_.Reset();
+#endif
+  fsr3_capture_.Reset();fsr3_has_resources_=false;
+  fsr3_capture_seen_[0]=fsr3_capture_seen_[1]=false;
+  fsr3_last_frame_ns_=0;fsr3_last_frame_=0;fsr3_failure_logged_=false;
+  fsr3_gaze_radius_=-1.f;
+  fsr3_contexts_configured_=false;
+  std::fill_n(fsr3_camera_identity_,2,0);
+}
+void OpenXrBackend::CaptureFsr3Scene(VkDevice device,VkCommandBuffer command,
+    const TemporalSceneInputs& inputs) {
+  if(!Fsr3InputsEnabled())return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(upscale_mode_!=3 || !vk_ || device!=vk_device_ || !single_guest_queue_ ||
+     queue_families_.size()!=1 || !frame_open_ || !published_pose_.valid ||
+     inputs.version!=1 || inputs.size<sizeof(TemporalSceneInputs) ||
+     inputs.eye<0 || inputs.eye>1 || !inputs.owner || !inputs.guest_framebuffer ||
+     (inputs.frame && inputs.frame!=published_pose_.frame))return;
+  const auto recording=command_records_.find(command);
+  if(recording==command_records_.end()||recording->second.family!=vk_queue_family_)return;
+  const int eye=FoveationSceneEyeLocked(device,inputs.width,inputs.height);
+  if(eye!=inputs.eye || eyes_[eye].owner!=inputs.owner ||
+     eyes_[eye].guest_framebuffer!=inputs.guest_framebuffer)return;
+  // A callback may run in a still-recording guest buffer. Never destroy its
+  // earlier snapshots merely because another candidate pass changes format.
+  if(fsr3_capture_.NeedsResize(inputs))return;
+  VkPhysicalDeviceMemoryProperties memory{};
+  vk_->GetPhysicalDeviceMemoryProperties(vk_physical_device_,&memory);
+  if(fsr3_capture_.Record(device,vk_->get_device_proc_addr,memory,command,inputs,published_pose_.frame)) {
+    const bool first=!fsr3_capture_seen_[eye];
+    fsr3_has_resources_=true;fsr3_capture_seen_[eye]=true;
+    if(first)Log("  [vr-fsr3] eye%d scene depth captured: %ux%u format=%d clear=%g known=%d frame=%llu\n",
+        eye,inputs.width,inputs.height,int(inputs.depth_format),inputs.depth_clear,
+        int(inputs.depth_clear_valid),static_cast<unsigned long long>(published_pose_.frame));
+  }
+}
+void OpenXrBackend::CaptureFsr3Motion(VkDevice device,VkCommandBuffer command,
+    const TemporalMotionInputs& inputs) {
+  if(!Fsr3InputsEnabled())return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(upscale_mode_!=3 || !vk_ || device!=vk_device_ || !single_guest_queue_ ||
+     queue_families_.size()!=1 || !frame_open_ || !published_pose_.valid ||
+     inputs.version!=1 || inputs.size<sizeof(TemporalMotionInputs) ||
+     inputs.eye<0 || inputs.eye>1 || !inputs.owner || !inputs.guest_framebuffer ||
+     (inputs.frame && inputs.frame!=published_pose_.frame))return;
+  const auto recording=command_records_.find(command);
+  if(recording==command_records_.end()||recording->second.family!=vk_queue_family_)return;
+  const int eye=FoveationSceneEyeLocked(device,inputs.width,inputs.height);
+  if(eye!=inputs.eye || eyes_[eye].owner!=inputs.owner ||
+     eyes_[eye].guest_framebuffer!=inputs.guest_framebuffer)return;
+  VkPhysicalDeviceMemoryProperties memory{};
+  vk_->GetPhysicalDeviceMemoryProperties(vk_physical_device_,&memory);
+  if(fsr3_capture_.RecordMotion(device,vk_->get_device_proc_addr,memory,command,inputs,published_pose_.frame)) {
+    fsr3_has_resources_=true;
+    static bool reported[2]{};
+    if(!reported[eye]) {
+      reported[eye]=true;
+      Log("  [vr-fsr3] eye%d verified native clip motion captured: %ux%u format=%d\n",
+          eye,inputs.width,inputs.height,int(inputs.format));
+    }
+  }
+}
+bool OpenXrBackend::FoveationHostCopyEnabled(VkDevice device) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return device==vk_device_ && foveation_host_copy_enabled_;
+}
+bool OpenXrBackend::FoveationSnapshot(VkDevice device,float* centers,float* radius,std::uint64_t* frame,int* level) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return FoveationSnapshotLocked(device,centers,radius,frame,level);
+}
+bool OpenXrBackend::FoveationSnapshotLocked(VkDevice device,float* centers,float* radius,std::uint64_t* frame,int* level) {
+  if(device!=vk_device_ || !centers || !radius || !frame || !level)return false;
+  const auto settings=ReadVideoSettings();const int quality=settings.foveation;
+  static int reported_quality=-1;
+  if(quality!=reported_quality) {
+    Log("  [vr-foveation] live quality profile %d\n",quality);
+    reported_quality=quality;
+  }
+  if(quality==0)return false;
+  // Explicit offscreen benchmark only: use a stationary centre while unworn.
+  // Keep xrEndFrame gated by the runtime's actual shouldRender value. Normal
+  // builds compile this path out and never substitute gaze for missing eyes.
+  if(FoveationBenchmark() && !frame_should_render_ && frame_views_valid_) {
+    std::fill_n(centers,4,0.f);
+    *radius=settings.gaze_radius;*frame=xr_begun_frames_;*level=quality;
+    static bool reported=false;if(!reported){Log("  [vr-foveation][benchmark] unworn offscreen scene, fixed centre; no projection submission or live gaze claim\n");reported=true;}
+    return true;
+  }
+  XrActions::EyeGazePose gaze;
+  {std::lock_guard<std::mutex> controller_lock(controller_mutex_);gaze=actions_.eye_gaze();}
+  if(!gaze.valid || gaze.frame!=published_pose_.frame || !frame_views_valid_)return false;
+  for(int i=0;i<2;++i)if(!internal::ProjectGazeNdc(gaze.orientation,frame_view_poses_[i].orientation,frame_views_[i].fov,&centers[i*2],&centers[i*2+1]))return false;
+  static bool reported=false;if(!reported){Log("  [vr-foveation] direct eye tracking drives per-eye full-quality focus\n");reported=true;}
+  *radius=settings.gaze_radius;*frame=xr_begun_frames_;*level=quality;return true;
 }
 
 void OpenXrBackend::NoteQueue(VkDevice device, VkQueue queue,
@@ -1587,6 +2265,9 @@ void OpenXrBackend::NoteQueue(VkDevice device, VkQueue queue,
   static_cast<void>(index);
   std::lock_guard<std::mutex> lock(mutex_);
   if (device == vk_device_ && queue != VK_NULL_HANDLE) {
+    // A newly exposed queue could write the eye images without ordering
+    // against the deferred copy. Drain before publishing that queue handle.
+    if (queue != vk_graphics_queue_) WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
     queue_families_[queue] = family;
   }
 }
@@ -1641,6 +2322,9 @@ void OpenXrBackend::ForgetCommandPool(VkCommandPool pool) {
 
 void OpenXrBackend::ResetCommandBuffer(VkCommandBuffer buffer) {
   std::lock_guard<std::mutex> lock(mutex_);
+#ifdef MOCKTAIL_ENABLE_FSR3
+  fsr3_capture_.Discard(buffer);
+#endif
   const auto found = command_records_.find(buffer);
   if (found != command_records_.end()) {
     for (const auto &image : found->second.eye_images) {
@@ -1659,6 +2343,9 @@ void OpenXrBackend::ResetCommandPool(VkCommandPool pool) {
   for (auto &entry : command_records_) {
     if (entry.second.pool != pool)
       continue;
+#ifdef MOCKTAIL_ENABLE_FSR3
+    fsr3_capture_.Discard(entry.first);
+#endif
     for (const auto &image : entry.second.eye_images) {
       const auto frame = eye_render_frames_.find(image.first);
       if (frame != eye_render_frames_.end() && frame->second == image.second) {
@@ -1676,6 +2363,10 @@ void OpenXrBackend::NoteCommandBuffersSubmitted(
   const auto family = queue_families_.find(queue);
   if (family == queue_families_.end() || !buffers)
     return;
+#ifdef MOCKTAIL_ENABLE_FSR3
+  if(queue==vk_graphics_queue_ && single_guest_queue_)
+    fsr3_capture_.Submitted(count,buffers);
+#endif
   for (std::uint32_t i = 0; i < count; ++i) {
     const auto command = command_records_.find(buffers[i]);
     if (command == command_records_.end() ||
@@ -1694,12 +2385,50 @@ VkImageLayout OpenXrBackend::NormalizeDesktopBarrier(VkCommandBuffer command,
                                                      std::uint32_t *destination,
                                                      VkImageLayout *old_layout,
                                                      VkImageLayout new_layout) {
+  if (!graphics::internal::NeedsDesktopQueueNormalization(*source, *destination))
+    return new_layout;
   std::lock_guard<std::mutex> lock(mutex_);
   const auto found = command_records_.find(command);
-  if (found == command_records_.end() || *source == *destination ||
-      *source >= VK_QUEUE_FAMILY_FOREIGN_EXT ||
-      *destination >= VK_QUEUE_FAMILY_FOREIGN_EXT)
-    return new_layout;
+  if (found == command_records_.end()) return new_layout;
+  return NormalizeDesktopBarrierLocked(found->second.family, image, source,
+                                        destination, old_layout, new_layout);
+}
+
+void OpenXrBackend::NormalizeDesktopBarriers(VkCommandBuffer command,
+    std::uint32_t count, VkImageMemoryBarrier* barriers) {
+  if (!graphics::internal::HasDesktopQueueTransfers(count, barriers)) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = command_records_.find(command);
+  if (found == command_records_.end()) return;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    auto& image = barriers[i];
+    if (graphics::internal::NeedsDesktopQueueNormalization(
+            image.srcQueueFamilyIndex, image.dstQueueFamilyIndex))
+      image.newLayout = NormalizeDesktopBarrierLocked(found->second.family,
+          image.image, &image.srcQueueFamilyIndex, &image.dstQueueFamilyIndex,
+          &image.oldLayout, image.newLayout);
+  }
+}
+
+void OpenXrBackend::NormalizeDesktopBarriers(VkCommandBuffer command,
+    std::uint32_t count, VkImageMemoryBarrier2* barriers) {
+  if (!graphics::internal::HasDesktopQueueTransfers(count, barriers)) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = command_records_.find(command);
+  if (found == command_records_.end()) return;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    auto& image = barriers[i];
+    if (graphics::internal::NeedsDesktopQueueNormalization(
+            image.srcQueueFamilyIndex, image.dstQueueFamilyIndex))
+      image.newLayout = NormalizeDesktopBarrierLocked(found->second.family,
+          image.image, &image.srcQueueFamilyIndex, &image.dstQueueFamilyIndex,
+          &image.oldLayout, image.newLayout);
+  }
+}
+
+VkImageLayout OpenXrBackend::NormalizeDesktopBarrierLocked(std::uint32_t family,
+    VkImage image, std::uint32_t* source, std::uint32_t* destination,
+    VkImageLayout* old_layout, VkImageLayout new_layout) {
   for (const auto &entry : desktop_swapchains_) {
     const auto &swapchain = entry.second;
     if (!swapchain.converted_to_concurrent ||
@@ -1708,13 +2437,12 @@ VkImageLayout OpenXrBackend::NormalizeDesktopBarrier(VkCommandBuffer command,
       continue;
     // Concurrent sharing: graphics->present transitions on release;
     // PRESENT/UNDEFINED->graphics transitions on acquire.
-    if (found->second.family == *destination &&
+    if (family == *destination &&
         *old_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
         *old_layout != VK_IMAGE_LAYOUT_UNDEFINED)
       *old_layout = new_layout;
     // Keep PRESENT until graphics acquire, even with an explicit release.
-    if (found->second.family == *source &&
-        *old_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+    if (family == *source && *old_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
       new_layout = *old_layout;
     *source = *destination = VK_QUEUE_FAMILY_IGNORED;
     return new_layout;
@@ -1791,6 +2519,8 @@ void OpenXrBackend::NoteDestroyImage(VkImage image) {
   WaitAsyncSubmissionsLocked(image);
   ForgetFxaaSourceLocked(image);
   images_.erase(image);
+  gaze_aa_.ForgetImage(image);
+  fsr_.ForgetImage(image);
   eye_render_queues_.erase(image);
   eye_render_frames_.erase(image);
   for (auto &command : command_records_) {
@@ -1899,6 +2629,7 @@ void OpenXrBackend::NoteRenderPassBegin(VkCommandBuffer command_buffer,
   binding.frame = published_pose_.frame;
   binding.image = target->image;
   binding.framebuffer = info->framebuffer;
+  binding.guest_framebuffer = guest_framebuffer;
   binding.owner = owner;
   binding.width = target->width;
   binding.height = target->height;
@@ -1994,8 +2725,95 @@ bool OpenXrBackend::RecommendedEyeExtent(std::uint32_t* width,
       xr_eye_width_[1] == 0 || xr_eye_height_[1] == 0) {
     return false;
   }
-  *width = std::max(xr_eye_width_[0], xr_eye_width_[1]);
-  *height = std::max(xr_eye_height_[0], xr_eye_height_[1]);
+  *width = FsrRenderSize(std::max(xr_eye_width_[0], xr_eye_width_[1]), upscale_mode_, fsr_settings_);
+  *height = FsrRenderHeight(std::max(xr_eye_width_[0],xr_eye_width_[1]),std::max(xr_eye_height_[0],xr_eye_height_[1]),upscale_mode_,fsr_settings_);
+  return true;
+}
+
+bool OpenXrBackend::UpdateEyeResolution() {
+  // A concurrent presentation must never hold up the guest state getter.
+  std::unique_lock<std::mutex> frame(frame_mutex_, std::try_to_lock);
+  if (!frame.owns_lock()) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!armed_ || !session_running_ || !vk_ || !vk_device_ ||
+      graphics_api_ != VrGraphicsApi::kVulkan || runtime_name_ != "SteamVR/OpenXR")
+    return false;
+  const auto settings = ReadVideoSettings();
+  const auto desired = settings.eye_resolution;
+  if (!desired) return false;
+  const auto now = perf::NowNs();
+  if (resize_candidate_ != desired) {
+    resize_candidate_ = desired;
+    resize_candidate_since_ = now;
+    return false;
+  }
+  // Avoid rebuilding buffers repeatedly while the slider is being dragged.
+  if (now-resize_candidate_since_ < 1'100'000'000ULL) return false;
+  double scale=EnvDouble("MOCKTAIL_VR_RENDER_SCALE",1.0);
+  if (!std::isfinite(scale) || scale<=0) scale=1.0;
+  scale=std::clamp(scale,.25,2.0);
+  const auto requested=static_cast<std::uint32_t>(std::lround(desired*scale));
+  std::uint32_t width[2],height[2];
+  bool changed=false;
+  for (int eye=0;eye<2;++eye) {
+    width[eye]=std::min(requested,xr_max_eye_width_[eye] ? xr_max_eye_width_[eye] : UINT32_MAX);
+    height[eye]=std::clamp<std::uint32_t>(static_cast<std::uint32_t>(
+        std::lround(double(width[eye])*xr_eye_height_[eye]/xr_eye_width_[eye])),1,
+        xr_max_eye_height_[eye] ? xr_max_eye_height_[eye] : UINT32_MAX);
+    changed |= width[eye]!=xr_eye_width_[eye] || height[eye]!=xr_eye_height_[eye];
+  }
+  if (!changed) return false;
+#ifdef MOCKTAIL_ENABLE_FSR3
+  if (fsr3_capture_.HasUnsubmitted()) return false;
+#endif
+  if (IdleHostDevice(vk_->DeviceWaitIdle,vk_device_) != VK_SUCCESS) return false;
+  if (foveation_.acquired()) {
+    foveation_.EndFrame();
+    foveation_used_in_frame_=false;
+  }
+  if (frame_open_) {
+    auto end=XrInfo<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
+    end.displayTime=frame_display_time_;
+    end.environmentBlendMode=static_cast<XrEnvironmentBlendMode>(xr_blend_mode_);
+    const auto result=CallXrQueue(vk_device_,vk_graphics_queue_,[&] {
+      return xrEndFrame(static_cast<XrSession>(xr_session_),&end);
+    });
+    if (XR_FAILED(result)) return false;
+    frame_open_=false;
+  }
+  EyeSwapchain previous[2];
+  std::uint32_t old_width[2],old_height[2];
+  for (int eye=0;eye<2;++eye) {
+    previous[eye]=std::move(eye_swapchains_[eye]);
+    eye_swapchains_[eye]={};
+    old_width[eye]=xr_eye_width_[eye];old_height[eye]=xr_eye_height_[eye];
+    xr_eye_width_[eye]=width[eye];xr_eye_height_[eye]=height[eye];
+  }
+  std::string error;
+  if (!CreateSwapchains(&error)) {
+    DestroySwapchains();
+    for (int eye=0;eye<2;++eye) {
+      eye_swapchains_[eye]=std::move(previous[eye]);
+      xr_eye_width_[eye]=old_width[eye];xr_eye_height_[eye]=old_height[eye];
+    }
+    resize_candidate_since_=now;
+    Log("  [vr-video] live resize deferred: %s\n",error.c_str());
+    return false;
+  }
+  DestroyFxaaTargetsLocked();
+  gaze_aa_.Reset();
+  fsr_.Reset();
+  ResetFsr3Locked();
+  for (auto& old:previous) {
+    if (old.swapchain) (void)xrDestroySwapchain(static_cast<XrSwapchain>(old.swapchain));
+  }
+  eyes_[0]={};eyes_[1]={};
+  eyes_bound_=false;
+  eye_render_queues_.clear();eye_render_frames_.clear();
+  InvalidateInFlightPose("live resolution change");
+  Log("  [vr-video] live resolution applied: render=%ux%u output=%ux%u per eye upscale=%d\n",
+      FsrRenderSize(width[0],upscale_mode_,fsr_settings_),FsrRenderHeight(width[0],height[0],upscale_mode_,fsr_settings_),
+      width[0],height[0],upscale_mode_);
   return true;
 }
 
@@ -2124,7 +2942,9 @@ void OpenXrBackend::HandleSessionState(int state) {
       end.displayTime = frame_display_time_;
       end.environmentBlendMode =
           static_cast<XrEnvironmentBlendMode>(xr_blend_mode_);
-      (void)xrEndFrame(static_cast<XrSession>(xr_session_), &end);
+      (void)CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+        return xrEndFrame(static_cast<XrSession>(xr_session_), &end);
+      });
       frame_open_ = false;
     }
     if (session_running_.load(std::memory_order_relaxed)) {
@@ -2289,6 +3109,12 @@ VkFormat internal::PreferredEyeSwapchainFormat(
   return VK_FORMAT_UNDEFINED;
 }
 
+bool internal::SingleUnprotectedVulkanQueue(const VkDeviceCreateInfo* info) {
+  return info && info->queueCreateInfoCount == 1 && info->pQueueCreateInfos &&
+      info->pQueueCreateInfos[0].queueCount == 1 &&
+      info->pQueueCreateInfos[0].flags == 0;
+}
+
 VkResult internal::WaitForPresentDependencies(VkDevice device, VkQueue queue,
                                               const VkPresentInfoKHR &present,
                                               VkFence fence,
@@ -2349,6 +3175,13 @@ bool OpenXrBackend::SupportsPresentQueueLocked(VkQueue queue) const {
   return GraphicsQueueForPresentLocked(queue) != VK_NULL_HANDLE;
 }
 
+VkQueue OpenXrBackend::FrameQueueForPresentLocked(VkQueue present) const {
+  if (queue_families_.find(present) == queue_families_.end())
+    return VK_NULL_HANDLE;
+  const auto verified = GraphicsQueueForPresentLocked(present);
+  return verified != VK_NULL_HANDLE ? verified : vk_graphics_queue_;
+}
+
 VkQueue OpenXrBackend::GraphicsQueueForPresentLocked(VkQueue present) const {
   if (queue_families_.find(present) == queue_families_.end())
     return VK_NULL_HANDLE;
@@ -2381,10 +3214,11 @@ VkResult OpenXrBackend::PrepareHostPresent(VkQueue queue, VkDevice device,
   if (!ready)
     return VK_NOT_READY;
   *ready = VK_NULL_HANDLE;
-  if (!armed_ || graphics_api_ != VrGraphicsApi::kVulkan || !vk_ ||
+  if (!armed_ || defer_initial_session_ || graphics_api_ != VrGraphicsApi::kVulkan || !vk_ ||
       device != vk_device_ || !info)
     return VK_NOT_READY;
-  if (!SupportsPresentQueueLocked(queue)) {
+  const auto frame_queue = FrameQueueForPresentLocked(queue);
+  if (frame_queue == VK_NULL_HANDLE) {
     if (!unsupported_present_queue_logged_) {
       unsupported_present_queue_logged_ = true;
       Log("  [vr-backend] waiting for verified eye-render submissions on "
@@ -2402,7 +3236,7 @@ VkResult OpenXrBackend::PrepareHostPresent(VkQueue queue, VkDevice device,
     *ready = mirrored;
     return VK_SUCCESS;
   }
-  const VkQueue graphics = GraphicsQueueForPresentLocked(queue);
+  const VkQueue graphics = frame_queue;
   const VkSemaphore signal =
       info->swapchainCount == 1 && info->pSwapchains && info->pImageIndices
           ? PresentReadySemaphoreLocked(info->pSwapchains[0],
@@ -2430,9 +3264,12 @@ VkResult OpenXrBackend::PrepareHostPresent(VkQueue queue, VkDevice device,
     }
     return VK_NOT_READY;
   }
-  return internal::WaitForPresentDependencies(
-      device, graphics, *info, copy_fence_, vk_->ResetFences, vk_->QueueSubmit,
-      vk_->WaitForFences);
+  const ScopedStageTimer dependencies_timer(perf::Stage::kPresentDependencies);
+  const auto synchronized=internal::WaitForPresentDependencies(
+      device, frame_queue, *info, copy_fence_,
+      vk_->ResetFences, vk_->QueueSubmit, vk_->WaitForFences);
+  if(synchronized==VK_SUCCESS)if(const auto reporter=g_pass_timing_reporter.load(std::memory_order_acquire))reporter(device,frame_queue);
+  return synchronized;
 }
 
 void OpenXrBackend::NoteHostPresent(VkQueue queue, VkDevice device) {
@@ -2456,8 +3293,8 @@ void OpenXrBackend::NoteHostPresent(VkQueue queue, VkDevice device) {
     state_lock_ = nullptr;
   }
   if (idle) {
-    // No running XR session (headset off or idle, session not READY, or
-    // recovering): nothing paces the guest, and with VR the desktop present
+    // No visible XR frame (headset idle, session not READY, or recovering):
+    // nothing paces the guest, and with VR the desktop present
     // is unthrottled. Cap it at 60 Hz, outside the backend lock.
     constexpr auto kIdleFrame = std::chrono::nanoseconds(16'666'667);
     static thread_local auto next = std::chrono::steady_clock::now();
@@ -2467,15 +3304,22 @@ void OpenXrBackend::NoteHostPresent(VkQueue queue, VkDevice device) {
   }
 }
 
+bool OpenXrBackend::NeedsIdlePacingLocked() const {
+  // shouldRender can be false temporarily even in a visible session. Only
+  // actual loss of visibility/session activity enables the separate idle cap.
+  return !session_running_.load(std::memory_order_acquire) || visibility_lost_;
+}
+
 bool OpenXrBackend::NoteHostPresentLocked(VkQueue queue, VkDevice device) {
+  if (defer_initial_session_) return true;
   if (!armed_.load(std::memory_order_acquire) || device != vk_device_) {
     return false;
   }
   if (graphics_api_ == VrGraphicsApi::kVulkan &&
-      !SupportsPresentQueueLocked(queue))
+      FrameQueueForPresentLocked(queue) == VK_NULL_HANDLE)
     return false;
   if (graphics_api_ == VrGraphicsApi::kVulkan)
-    queue = GraphicsQueueForPresentLocked(queue);
+    queue = FrameQueueForPresentLocked(queue);
   try {
     if (xr_session_ == nullptr && !RecoverSessionLocked(perf::NowNs()))
       return true;
@@ -2486,8 +3330,11 @@ bool OpenXrBackend::NoteHostPresentLocked(VkQueue queue, VkDevice device) {
     perf::ProcessCollector().Count(perf::Counter::kPresents);
     RunFrameCycle(queue, device);
     perf::ProcessCollector().EmitIfDue(perf::NowNs(), "xr-frame-cycle");
-    return false;
+    // A running session may still be in standby. xrWaitFrame can then return
+    // immediately; avoid rendering at the active HMD cap when nothing is shown.
+    return NeedsIdlePacingLocked();
   } catch (const XrCallError &error) {
+    WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
     // Every frame error is retried on the existing guest device with backoff;
     // a lost or failed runtime additionally gets a fresh XrInstance.
     if (error.result == XR_ERROR_INSTANCE_LOST ||
@@ -2499,6 +3346,7 @@ bool OpenXrBackend::NoteHostPresentLocked(VkQueue queue, VkDevice device) {
         error.what());
     TeardownSessionLocked("XR frame error", true);
   } catch (const std::exception &error) {
+    WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
     // Includes the swapchain-image and copy-fence timeouts: transient stalls
     // (a hitching compositor) must not end VR for the rest of the session.
     Log("  [vr-backend] frame cycle failed: %s; recovering the session\n",
@@ -2517,6 +3365,9 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
   if (unpaced && frame_open_ && perf::NowNs() < frame_due_ns_) {
     return;
   }
+  // Wait for SteamVR to establish the application CPU allocation first.
+  if (submitted_frames_.load(std::memory_order_relaxed) >= 30)
+    PreferAllowedPerformanceCores();
   const ScopedStageTimer cycle_timer(perf::Stage::kFrameCycle);
   const auto session = static_cast<XrSession>(xr_session_);
   const auto instance = static_cast<XrInstance>(xr_instance_);
@@ -2524,6 +3375,11 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
   // ---- finish the XR frame whose predicted display time covered the frame
   // Roblox just rendered (eye images are complete at present time).
   if (frame_open_) {
+    if (foveation_.acquired()) {
+      if (foveation_used_in_frame_) (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
+      foveation_.EndFrame();
+      foveation_used_in_frame_ = false;
+    }
     auto end = XrInfo<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
     end.displayTime = frame_display_time_;
     end.environmentBlendMode =
@@ -2546,7 +3402,8 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
         eyes_[1].frame == published_pose_.frame &&
         applied_poses_[eyes_[0].owner] == published_pose_.frame;
     const bool can_submit =
-        frame_should_render_ && pose_ready && eye_frames_match && eyes_usable;
+        frame_should_render_ && pose_ready && eye_frames_match && eyes_usable &&
+        (graphics_api_ != VrGraphicsApi::kVulkan || SupportsPresentQueueLocked(queue));
     if (!can_submit) {
       // One dominant reason per skipped frame, checked in pipeline order.
       if (visibility_lost_ && !frame_should_render_) {
@@ -2573,9 +3430,11 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
           auto acquire = XrInfo<XrSwapchainImageAcquireInfo>(
               XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
           CheckXr(instance,
-                  xrAcquireSwapchainImage(
-                      static_cast<XrSwapchain>(eye_swapchains_[eye].swapchain),
-                      &acquire, &index),
+                  CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+                    return xrAcquireSwapchainImage(
+                        static_cast<XrSwapchain>(eye_swapchains_[eye].swapchain),
+                        &acquire, &index);
+                  }),
                   "xrAcquireSwapchainImage");
         }
         {
@@ -2614,9 +3473,11 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
         if (images_held[eye]) {
           auto release = XrInfo<XrSwapchainImageReleaseInfo>(
               XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
-          (void)xrReleaseSwapchainImage(
-              static_cast<XrSwapchain>(eye_swapchains_[eye].swapchain),
-              &release);
+          (void)CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+            return xrReleaseSwapchainImage(
+                static_cast<XrSwapchain>(eye_swapchains_[eye].swapchain),
+                &release);
+          });
           eye_swapchains_[eye].image_acquired = false;
         }
       }
@@ -2666,7 +3527,9 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
         }
       }
     }
-    CheckXr(instance, xrEndFrame(session, &end), "xrEndFrame");
+    CheckXr(instance, CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+      return xrEndFrame(session, &end);
+    }), "xrEndFrame");
     frame_open_ = false;
     if (end.layerCount > 0) {
       perf::ProcessCollector().Count(perf::Counter::kFramesSubmitted);
@@ -2699,6 +3562,12 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
     }
   }
 
+  static PerformancePublisher performance;
+  performance.Update(perf::NowNs(), submitted_frames_.load(std::memory_order_relaxed),
+                     session_running_ && !visibility_lost_,
+                     eye_swapchains_[0].width, eye_swapchains_[0].height,
+                     eyes_[0].width, eyes_[0].height);
+
   // ---- open the XR frame for the Roblox frame that is about to render.
   std::uint64_t predicted_display_time = 0;
   bool should_render = false;
@@ -2723,7 +3592,9 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
     {
       const ScopedStageTimer begin_timer(perf::Stage::kXrBeginFrame);
       auto begin_info = XrInfo<XrFrameBeginInfo>(XR_TYPE_FRAME_BEGIN_INFO);
-      CheckXr(instance, xrBeginFrame(session, &begin_info), "xrBeginFrame");
+      CheckXr(instance, CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+        return xrBeginFrame(session, &begin_info);
+      }), "xrBeginFrame");
     }
     predicted_display_time = state.predictedDisplayTime;
     should_render = state.shouldRender;
@@ -2737,8 +3608,14 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
   applied_poses_.clear();
   frame_views_valid_ = false;
   perf::ProcessCollector().Count(perf::Counter::kFramesBegun);
+  ++xr_begun_frames_;
+  // Native density maps now use direct gaze and application-owned images.
+  // The capability/control swapchain supplies only the map extent in this
+  // path; acquiring/waiting/querying it every frame produces no rendered data.
+  if (should_render && !foveation_device_enabled_ && foveation_.ready())
+    (void)foveation_.BeginFrame();
 
-  if (should_render) {
+  if (should_render || FoveationBenchmark()) {
     auto locate_info = XrInfo<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
     locate_info.viewConfigurationType =
         XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2883,6 +3760,26 @@ void OpenXrBackend::RunFrameCycle(VkQueue queue, VkDevice device) {
           std::copy_n(frame_views_[eye].fov, 4, published_pose_.eye_fov[eye]);
           frame_views_[eye].valid = true;
         }
+        published_pose_.projection_jitter_valid=false;
+#ifdef MOCKTAIL_ENABLE_FSR3
+        if(upscale_mode_==3 && published_pose_.valid &&
+           fsr3_last_frame_ && published_pose_.frame==fsr3_last_frame_+1 &&
+           perf::NowNs()-fsr3_last_frame_ns_<250'000'000ULL && NativeProjectionBridgeReady()) {
+          const auto output=std::max(xr_eye_width_[0],xr_eye_width_[1]);
+          const auto render=FsrRenderSize(output,upscale_mode_,fsr_settings_);
+          const auto height=FsrRenderHeight(output,std::max(xr_eye_height_[0],xr_eye_height_[1]),
+                                           upscale_mode_,fsr_settings_);
+          const auto focus=fsr3_transport_.dimensions();
+          const auto jitter=Fsr3Upscaler::Jitter(published_pose_.frame,
+              focus.input_width?focus.input_width:render,
+              focus.output_width?focus.output_width:output);
+          published_pose_.projection_jitter_pixels[0]=jitter.x;
+          published_pose_.projection_jitter_pixels[1]=jitter.y;
+          published_pose_.projection_render_width=render;
+          published_pose_.projection_render_height=height;
+          published_pose_.projection_jitter_valid=true;
+        }
+#endif
         frame_views_valid_ = published_pose_.valid;
         // Head-pose evidence cadence is tunable so the scripted-motion canary
         // can observe at least two distinct samples within a short run; the
@@ -3084,8 +3981,10 @@ bool OpenXrBackend::PrepareVirtualKeyboardLayerLocked(VkQueue queue) {
     auto acquire = XrInfo<XrSwapchainImageAcquireInfo>(
         XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
     CheckXr(instance,
-            xrAcquireSwapchainImage(static_cast<XrSwapchain>(slot.swapchain),
-                                    &acquire, &index),
+            CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+              return xrAcquireSwapchainImage(static_cast<XrSwapchain>(slot.swapchain),
+                  &acquire, &index);
+            }),
             "xrAcquireSwapchainImage keyboard");
     auto wait =
         XrInfo<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
@@ -3107,8 +4006,10 @@ bool OpenXrBackend::PrepareVirtualKeyboardLayerLocked(VkQueue queue) {
     }
     auto release = XrInfo<XrSwapchainImageReleaseInfo>(
         XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
-    (void)xrReleaseSwapchainImage(static_cast<XrSwapchain>(slot.swapchain),
-                                  &release);
+    (void)CallXrQueue(vk_device_, vk_graphics_queue_, [&] {
+      return xrReleaseSwapchainImage(static_cast<XrSwapchain>(slot.swapchain),
+          &release);
+    });
     // A released image is what the quad shows, even if this upload failed
     // after an earlier one succeeded.
     if (uploaded) {
@@ -3209,7 +4110,7 @@ bool OpenXrBackend::UploadVirtualKeyboardVulkan(VkQueue queue, VkImage image) {
   barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                           nullptr, 1, &barrier);
   if (vk_->EndCommandBuffer(copy_command_) != VK_SUCCESS ||
@@ -3328,6 +4229,10 @@ bool OpenXrBackend::EnsureCopyResources(VkDevice device,
 }
 
 void OpenXrBackend::DestroyCopyResources() {
+  WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
+  gaze_aa_.Reset();
+  fsr_.Reset();
+  ResetFsr3Locked();
   DestroyFxaaLocked();  // callers idle the device first
   mirror_ready_ = VK_NULL_HANDLE;
   mirror_readback_ = {};
@@ -3372,6 +4277,7 @@ OpenXrBackend::AsyncSubmission *OpenXrBackend::NextAsyncSubmissionLocked() {
     slot.pending = false;
   }
   slot.images.clear();
+  slot.eye_resources = false;
   if (vk_->ResetFences(vk_device_, 1, &slot.fence) != VK_SUCCESS ||
       vk_->ResetCommandBuffer(slot.command, 0) != VK_SUCCESS)
     return nullptr;
@@ -3412,6 +4318,27 @@ void OpenXrBackend::WaitAsyncSubmissionsLocked(VkImage image) {
   }
 }
 
+void OpenXrBackend::WaitEyeResourcesLocked() {
+  if (!vk_ || !vk_device_) return;
+  bool completed = false;
+  for (auto& slot : async_) {
+    if (!slot.pending || !slot.eye_resources) continue;
+    const ScopedStageTimer timer(perf::Stage::kCopyFenceWait);
+    perf::ProcessCollector().Count(perf::Counter::kFenceWaits);
+    if (vk_->WaitForFences(vk_device_, 1, &slot.fence, VK_TRUE,
+                          2'000'000'000ULL) != VK_SUCCESS) {
+      (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
+      throw std::runtime_error("XR eye-resource fence wait failed");
+    }
+    slot.pending = false;
+    slot.images.clear();
+    completed = true;
+  }
+  if (completed)
+    if (const auto report = g_pass_timing_reporter.load(std::memory_order_acquire))
+      report(vk_device_, vk_graphics_queue_);
+}
+
 VkSemaphore OpenXrBackend::PresentReadySemaphoreLocked(
     VkSwapchainKHR swapchain, std::uint32_t image_index, PresentStep step) {
   const auto found = desktop_swapchains_.find(swapchain);
@@ -3448,6 +4375,7 @@ void OpenXrBackend::DestroyRetiredSemaphoresLocked() {
 }
 
 bool OpenXrBackend::CopyEyesIntoSwapchains(VkQueue queue) {
+  WaitEyeResourcesLocked();
   std::string error;
   const auto family = queue_families_.find(queue);
   if (family == queue_families_.end() || family->second != vk_queue_family_)
@@ -3465,8 +4393,8 @@ bool OpenXrBackend::CopyEyesIntoSwapchains(VkQueue queue) {
         swapchain.acquired_index >= swapchain.images.size()) {
       return false;
     }
-    if (eyes_[eye].width != swapchain.width ||
-        eyes_[eye].height != swapchain.height) {
+    if (eyes_[eye].width != FsrRenderSize(swapchain.width,upscale_mode_,fsr_settings_) ||
+        eyes_[eye].height != FsrRenderHeight(swapchain.width,swapchain.height,upscale_mode_,fsr_settings_)) {
       Log("  [vr-backend] eye%d extent %ux%u does not match swapchain %ux%u\n",
           eye, eyes_[eye].width, eyes_[eye].height, swapchain.width,
           swapchain.height);
@@ -3476,29 +4404,149 @@ bool OpenXrBackend::CopyEyesIntoSwapchains(VkQueue queue) {
   const VkImage destination[2] = {
       eye_swapchains_[0].images[eye_swapchains_[0].acquired_index],
       eye_swapchains_[1].images[eye_swapchains_[1].acquired_index]};
-  // Publish the last readback before its staging is resized or overwritten.
   PublishMirrorReadbackLocked();
   EnsureMirrorForExtent(eyes_[0].width, eyes_[0].height);
 
-  // Before taking a slot: rebinding an eye waits for every pending one.
-  // SMAA builds on FXAA's targets and falls back to FXAA when it cannot run.
-  const bool filtered = PrepareFxaaLocked();
-  const bool smaa = filtered && AntiAliasingMode() == AntiAliasing::kSmaa &&
-                    PrepareSmaaLocked();
-  if (filtered) {
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      Log("  [vr-backend] %s anti-aliasing on (%ux%u per eye)\n",
-          smaa ? "SMAA" : "FXAA", eye_swapchains_[0].width,
-          eye_swapchains_[0].height);
+  bool aa_ready[2]={false,false},fsr_ready[2]={false,false},gaze_ready[2]={false,false};
+  float gaze_x[2]{},gaze_y[2]{};
+  XrActions::EyeGazePose gaze;
+  { std::lock_guard<std::mutex> controller_lock(controller_mutex_);gaze=actions_.eye_gaze(); }
+  if(gaze.valid && gaze.frame==published_pose_.frame && frame_views_valid_)
+    for(int eye=0;eye<2;++eye)
+      gaze_ready[eye]=internal::ProjectGazeNdc(gaze.orientation,frame_view_poses_[eye].orientation,
+                        frame_views_[eye].fov,&gaze_x[eye],&gaze_y[eye]);
+  const auto video_settings=ReadVideoSettings();
+  const int aa_mode=internal::NativeAntiAliasingMode(video_settings.aa_mode);
+  VkPhysicalDeviceMemoryProperties aa_memory{};
+  if(aa_mode>0 || upscale_mode_>0)vk_->GetPhysicalDeviceMemoryProperties(vk_physical_device_,&aa_memory);
+  VkImage copy_source[2]={source[0],source[1]};
+  VkFormat copy_format[2]={eyes_[0].format,eyes_[1].format};
+  std::uint32_t copy_width[2]={eyes_[0].width,eyes_[1].width};
+  std::uint32_t copy_height[2]={eyes_[0].height,eyes_[1].height};
+  if(upscale_mode_==1 || upscale_mode_==2) {
+    for(int eye=0;eye<2;++eye) {
+      const auto image=images_.find(source[eye]);
+      fsr_ready[eye]=image!=images_.end() && (image->second.usage&VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        fsr_.Prepare(vk_device_,vk_->get_device_proc_addr,aa_memory,eye,source[eye],eyes_[eye].format,
+                     destination[eye],eye_swapchains_[eye].format,eyes_[eye].width,eyes_[eye].height,
+                     eye_swapchains_[eye].width,eye_swapchains_[eye].height,upscale_mode_==2);
+    }
+    if(!fsr_ready[0] || !fsr_ready[1]) {
+      fsr_ready[0]=fsr_ready[1]=false;
+      if(!fsr_failure_logged_)Log("  [vr-fsr] resources unavailable; using a linear upscale for this frame\n");
+      fsr_failure_logged_=true;
+    } else {
+      fsr_failure_logged_=false;
+      for(int eye=0;eye<2;++eye) {
+        copy_source[eye]=fsr_.image(eye);copy_format[eye]=fsr_.intermediate_format();
+        copy_width[eye]=eye_swapchains_[eye].width;copy_height[eye]=eye_swapchains_[eye].height;
+      }
     }
   }
-  AsyncSubmission *const slot = NextAsyncSubmissionLocked();
-  if (slot == nullptr) {
-    (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
-    throw std::runtime_error("XR copy fence wait failed");
+#ifdef MOCKTAIL_ENABLE_FSR3
+  Fsr3Upscaler::Frame fsr3_frames[2];
+  Fsr3GazeTransport::BeginInfo fsr3_begin[2];
+  bool fsr3_ready=false;
+  if(upscale_mode_==3) {
+    NativeProjectionSample camera[2];
+    const Fsr3SceneCapture::Eye* depth[2]{};
+    const Fsr3SceneCapture::Motion* motion[2]{};
+    bool inputs_ready=fsr3_device_supported_ && single_guest_queue_ && queue_families_.size()==1 &&
+        eyes_[0].width==eyes_[1].width && eyes_[0].height==eyes_[1].height &&
+        eyes_[0].format==eyes_[1].format;
+    for(int eye=0;eye<2;++eye) {
+      depth[eye]=fsr3_capture_.Get(eye,published_pose_.frame,eyes_[eye].width,eyes_[eye].height);
+      motion[eye]=fsr3_capture_.GetMotion(eye,published_pose_.frame,eyes_[eye].width,eyes_[eye].height);
+      inputs_ready &= depth[eye] && ReadNativeProjectionSample(eye,published_pose_.frame,&camera[eye]);
+    }
+    if(inputs_ready && camera[0].depth_inverted==camera[1].depth_inverted &&
+       camera[0].depth_infinite==camera[1].depth_infinite) {
+      if(fsr3_gaze_radius_!=video_settings.gaze_radius) {
+        // Eye-resource fences were drained above; the new crop size can now
+        // replace its descriptors and independent temporal histories safely.
+        fsr3_.Reset();fsr3_transport_.Reset();
+        fsr3_last_frame_ns_=0;fsr3_last_frame_=0;
+        fsr3_contexts_configured_=false;
+        fsr3_gaze_radius_=video_settings.gaze_radius;
+      }
+      Fsr3Upscaler::Configuration configuration;
+      configuration.inverted_depth=camera[0].depth_inverted;
+      configuration.infinite_depth=camera[0].depth_infinite;
+      configuration.estimate_motion=!(motion[0]&&motion[1]);
+      configuration.motion_vectors_jittered=!configuration.estimate_motion;
+      fsr3_ready=fsr3_transport_.Prepare(vk_device_,vk_->get_device_proc_addr,aa_memory,
+          eyes_[0].format,eyes_[0].width,eyes_[0].height,
+          eye_swapchains_[0].width,eye_swapchains_[0].height,video_settings.gaze_radius);
+      if(fsr3_ready) {
+        const auto focus=fsr3_transport_.dimensions();
+        configuration.render_width=focus.input_width;configuration.render_height=focus.input_height;
+        configuration.output_width=focus.output_width;configuration.output_height=focus.output_height;
+        if(fsr3_contexts_configured_ &&
+           (fsr3_estimate_motion_!=configuration.estimate_motion ||
+            fsr3_depth_inverted_!=configuration.inverted_depth ||
+            fsr3_depth_infinite_!=configuration.infinite_depth)) {
+          fsr3_.Reset();fsr3_last_frame_ns_=0;fsr3_last_frame_=0;
+          fsr3_contexts_configured_=false;
+        }
+        fsr3_has_resources_=true;
+        fsr3_ready=fsr3_.Configure(vk_physical_device_,vk_device_,vk_->get_device_proc_addr,
+                                  aa_memory,configuration);
+        if(fsr3_ready) {
+          fsr3_contexts_configured_=true;
+          fsr3_estimate_motion_=configuration.estimate_motion;
+          fsr3_depth_inverted_=configuration.inverted_depth;
+          fsr3_depth_infinite_=configuration.infinite_depth;
+        }
+      }
+      if(fsr3_ready) {
+        const auto now=perf::NowNs();
+        const bool reset=!fsr3_last_frame_ns_ || published_pose_.frame!=fsr3_last_frame_+1 ||
+            now-fsr3_last_frame_ns_>250'000'000ULL;
+        for(int eye=0;eye<2;++eye) {
+          auto& f=fsr3_frames[eye];f.color=fsr3_transport_.color(eye);f.output=fsr3_transport_.output(eye);
+          auto& begin=fsr3_begin[eye];begin.encoded_source=source[eye];
+          begin.depth={depth[eye]->depth,depth[eye]->format,depth[eye]->width,depth[eye]->height};
+          begin.gaze_x=.5f*(1.f+gaze_x[eye]);begin.gaze_y=.5f*(1.f-gaze_y[eye]);
+          begin.reset=reset || camera[eye].camera_identity!=fsr3_camera_identity_[eye] ||
+              camera[eye].camera_near!=fsr3_camera_near_[eye] ||
+              camera[eye].camera_far!=fsr3_camera_far_[eye];
+          f.depth=fsr3_transport_.depth(eye);
+          if(!configuration.estimate_motion) {
+            begin.motion={motion[eye]->image,motion[eye]->format,motion[eye]->width,motion[eye]->height};
+            f.motion_vector_scale[0]=f.motion_vector_scale[1]=1.f;
+          }
+          f.jitter={camera[eye].jitter_pixels[0],camera[eye].jitter_pixels[1]};
+          f.delta_ms=fsr3_last_frame_ns_?std::clamp(float(now-fsr3_last_frame_ns_)/1e6f,1.f,250.f):1000.f/72.f;
+          f.near_plane=camera[eye].camera_near;f.far_plane=camera[eye].camera_far;
+          f.vertical_fov=2.f*std::atan(fsr3_transport_.vertical_fov_scale()/std::abs(camera[eye].projection[5]));
+          f.meters_per_world_unit=.3f; // Verified native tracking conversion: 10/3 studs per metre.
+          f.sharpening=true;f.sharpness=.55f;f.reset=begin.reset;
+          fsr3_camera_identity_[eye]=camera[eye].camera_identity;
+          fsr3_camera_near_[eye]=camera[eye].camera_near;
+          fsr3_camera_far_[eye]=camera[eye].camera_far;
+          copy_source[eye]=fsr3_transport_.encoded(eye);copy_format[eye]=fsr3_transport_.encoded_format();
+          copy_width[eye]=eye_swapchains_[eye].width;copy_height[eye]=eye_swapchains_[eye].height;
+        }
+      }
+    }
+    if(!fsr3_ready && !fsr3_failure_logged_)
+      Log("  [vr-fsr3] waiting for matching submitted depth, native camera, and temporal resources (SDK=%d)\n",fsr3_.last_error());
+    fsr3_failure_logged_=!fsr3_ready;
   }
+#endif
+  if(gaze.valid && gaze.frame==published_pose_.frame && frame_views_valid_) {
+    for(int eye=0;eye<2;++eye) {
+      const auto image=images_.find(source[eye]);
+      const bool sampled=fsr_ready[eye] || (image!=images_.end() && (image->second.usage&VK_IMAGE_USAGE_SAMPLED_BIT));
+      if(aa_mode>0 && gaze_ready[eye] && sampled && copy_width[eye]==eye_swapchains_[eye].width && copy_height[eye]==eye_swapchains_[eye].height)
+        aa_ready[eye]=gaze_aa_.Prepare(vk_device_,vk_->get_device_proc_addr,eye,copy_source[eye],copy_format[eye],
+                        destination[eye],eye_swapchains_[eye].format,copy_width[eye],copy_height[eye],aa_mode,&aa_memory);
+    }
+  }
+
+  const bool fxaa = aa_mode == 0 && PrepareFxaaLocked();
+  AsyncSubmission* const slot = NextAsyncSubmissionLocked();
+  if (!slot) throw std::runtime_error("XR copy fence wait failed");
   const VkCommandBuffer command = slot->command;
   VkCommandBufferBeginInfo begin{};
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -3507,10 +4555,163 @@ bool OpenXrBackend::CopyEyesIntoSwapchains(VkQueue queue) {
     return false;
   }
 
-  if (filtered)
-    RecordFilteredEyesLocked(command, smaa);
-  else
-    RecordEyeCopiesLocked(command, source, destination);
+  if (fxaa) {
+    RecordFxaaEyesLocked(command);
+  } else {
+  // Phase 1: transition both sources to TRANSFER_SRC and both swapchain
+  // destinations to TRANSFER_DST in one barrier batch.
+  std::array<VkImageMemoryBarrier, 4> prepare{};
+  for (int eye = 0; eye < 2; ++eye) {
+    VkImageMemoryBarrier& source_barrier = prepare[eye];
+    source_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    source_barrier.srcAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    source_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    source_barrier.oldLayout = eyes_[eye].final_layout;
+    source_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source_barrier.image = source[eye];
+    source_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkImageMemoryBarrier& destination_barrier = prepare[2 + eye];
+    destination_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    destination_barrier.srcAccessMask = 0;
+    destination_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    destination_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    destination_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    destination_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    destination_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    destination_barrier.image = destination[eye];
+    destination_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                            1};
+  }
+  vk_->CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                          nullptr, static_cast<std::uint32_t>(prepare.size()),
+                          prepare.data());
+
+  for(int eye=0;eye<2;++eye)if(fsr_ready[eye])fsr_.RecordUpscale(command,eye,gaze_x[eye],gaze_y[eye],video_settings.gaze_radius);
+#ifdef MOCKTAIL_ENABLE_FSR3
+  if(fsr3_ready) {
+    bool recorded=true;
+    for(int eye=0;eye<2;++eye) {
+      if(!fsr3_transport_.Begin(command,eye,fsr3_begin[eye])) {recorded=false;break;}
+      fsr3_frames[eye].motion_vectors=fsr3_begin[eye].motion.image
+          ?fsr3_transport_.motion(eye):Fsr3Upscaler::Image{};
+      fsr3_frames[eye].reset|=fsr3_transport_.reset_history(eye);
+      if(!fsr3_.Record(command,eye,fsr3_frames[eye])) {recorded=false;break;}
+      fsr3_transport_.Finish(command,eye);
+    }
+    if(!recorded) {
+      // A failed SDK dispatch may have queued only part of its jobs. Discard
+      // this copy command instead of presenting a partial or uninitialized eye.
+      (void)vk_->EndCommandBuffer(command);
+      fsr3_.Reset();fsr3_last_frame_ns_=0;fsr3_last_frame_=0;
+      fsr3_contexts_configured_=false;
+      Log("  [vr-fsr3] dispatch failed; temporal history reset\n");return false;
+    }
+    fsr3_last_frame_ns_=perf::NowNs();fsr3_last_frame_=published_pose_.frame;
+    static bool reported=false;
+    if(!reported) {
+      reported=true;
+      const auto focus=fsr3_transport_.dimensions();
+      Log("  [vr-fsr3] AMD FSR 3.1.4 gaze stereo dispatch active: %ux%u -> %ux%u, focus=%ux%u -> %ux%u, motion=%s, frame=%llu\n",
+          eyes_[0].width,eyes_[0].height,eye_swapchains_[0].width,eye_swapchains_[0].height,
+          focus.input_width,focus.input_height,focus.output_width,focus.output_height,
+          fsr3_frames[0].motion_vectors.image?"native clip vectors":"AMD Optical Flow",
+          static_cast<unsigned long long>(published_pose_.frame));
+    }
+  }
+#endif
+
+  // Phase 2: both eye copies (plus the mirror readbacks when enabled) in one
+  // recording.
+  const VkImageSubresourceLayers subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                             1};
+  for (int eye = 0; eye < 2; ++eye) {
+    const EyeBinding& binding = eyes_[eye];
+    const EyeSwapchain& swapchain = eye_swapchains_[eye];
+    if (FormatIsCopyCompatible(copy_format[eye], swapchain.format) &&
+        copy_width[eye]==swapchain.width && copy_height[eye]==swapchain.height) {
+      VkImageCopy region{};
+      region.srcSubresource = subresource;
+      region.dstSubresource = subresource;
+      region.extent = {copy_width[eye], copy_height[eye], 1};
+      vk_->CmdCopyImage(command, copy_source[eye],
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination[eye],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    } else {
+      VkImageBlit region{};
+      region.srcSubresource = subresource;
+      region.dstSubresource = subresource;
+      region.srcOffsets[1] = {static_cast<std::int32_t>(copy_width[eye]),
+                              static_cast<std::int32_t>(copy_height[eye]), 1};
+      region.dstOffsets[1] = {static_cast<std::int32_t>(swapchain.width),static_cast<std::int32_t>(swapchain.height),1};
+      vk_->CmdBlitImage(command, copy_source[eye],
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination[eye],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                        upscale_mode_>0?VK_FILTER_LINEAR:VK_FILTER_NEAREST);
+    }
+    if (mirror_.enabled()) {
+      // Reads the source while it is already TRANSFER_SRC; the restore
+      // barrier below returns it to the guest's final layout afterwards.
+      mirror_.RecordEyeCopy(MirrorProcs(), command, eye, source[eye],
+                            binding.final_layout, binding.width,
+                            binding.height);
+    }
+  }
+
+  // FXAA reads only the final resolved eye. It keeps the existing stereo
+  // provenance and adds no extra submit, fence, or desktop window.
+  for(int eye=0;eye<2;++eye)if(aa_ready[eye])
+    aa_ready[eye]=gaze_aa_.Record(command,eye,gaze_x[eye],gaze_y[eye],aa_mode,video_settings.gaze_radius);
+
+  if(upscale_mode_==2)for(int eye=0;eye<2;++eye)if(fsr_ready[eye] && gaze_ready[eye]) {
+    TemporalEyePose current;
+    std::copy_n(frame_view_poses_[eye].orientation,4,current.orientation);
+    std::copy_n(frame_view_poses_[eye].position,3,current.position);
+    std::copy_n(frame_views_[eye].fov,4,current.fov);
+    fsr_.RecordTemporal(command,eye,current,gaze_x[eye],gaze_y[eye],video_settings.gaze_radius,perf::NowNs());
+  }
+
+  for(int eye=0;eye<2;++eye)if(fsr_ready[eye] && gaze_ready[eye])
+    fsr_.RecordSharpen(command,eye,gaze_x[eye],gaze_y[eye],video_settings.gaze_radius);
+
+  // Phase 3: restore the eye images to their render-pass final layouts and
+  // leave the swapchain images as color attachments for the compositor.
+  std::array<VkImageMemoryBarrier, 4> finish{};
+  for (int eye = 0; eye < 2; ++eye) {
+    VkImageMemoryBarrier& restore_source = finish[eye];
+    restore_source.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    restore_source.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    restore_source.dstAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    restore_source.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    restore_source.newLayout = eyes_[eye].final_layout;
+    restore_source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    restore_source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    restore_source.image = source[eye];
+    restore_source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkImageMemoryBarrier& finish_destination = finish[2 + eye];
+    finish_destination.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    finish_destination.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    finish_destination.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    finish_destination.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    finish_destination.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    finish_destination.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finish_destination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finish_destination.image = destination[eye];
+    finish_destination.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                           1};
+  }
+  vk_->CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                          nullptr, static_cast<std::uint32_t>(finish.size()),
+                          finish.data());
+
+  }
 
   if (vk_->EndCommandBuffer(command) != VK_SUCCESS) {
     return false;
@@ -3519,17 +4720,21 @@ bool OpenXrBackend::CopyEyesIntoSwapchains(VkQueue queue) {
   submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command;
-  // The present dependencies were consumed earlier on this queue, so the
-  // copy runs after the guest's eye passes without the CPU waiting for them.
-  // xrReleaseSwapchainImage only needs the copy submitted to this queue.
-  // NoteDestroyImage waits for this slot before the guest frees a source.
+  // Present waits are queued on this same graphics queue; the copy follows
+  // the guest rendering without waiting for this frame on the CPU.
   slot->images = {source[0], source[1], destination[0], destination[1]};
-  if (SubmitAsyncLocked(queue, slot, submit) != VK_SUCCESS) {
-    return false;
-  }
+  slot->eye_resources = true;
+  if (SubmitAsyncLocked(queue, slot, submit) != VK_SUCCESS) return false;
   if (mirror_.enabled())
-    mirror_readback_ = {slot,           slot->serial,    published_pose_.frame,
+    mirror_readback_ = {slot, slot->serial, published_pose_.frame,
                         eyes_[0].format, eyes_[0].width, eyes_[0].height};
+  static const bool early = EnvString("MOCKTAIL_VR_EARLY_SUBMIT", "1") != "0";
+  static const bool deferred = EnvString("MOCKTAIL_VR_DEFER_COPY_WAIT", "1") != "0";
+  // Unknown/multiple guest queues retain completed-copy semantics. Queue
+  // ordering is proven only for the single unprotected binding queue.
+  if (!early || !deferred || !single_guest_queue_ || queue_families_.size() != 1 ||
+      queue != vk_graphics_queue_ || !EvidenceDirectory().empty() || keyboard_.visible())
+    WaitEyeResourcesLocked();
   return true;
 }
 
@@ -3639,86 +4844,15 @@ void OpenXrBackend::RecordEyeCopiesLocked(VkCommandBuffer command,
                           finish.data());
 }
 
-OpenXrBackend::AntiAliasing OpenXrBackend::AntiAliasingMode() const {
-  static const AntiAliasing mode = [] {
-    const std::string name = EnvString("MOCKTAIL_VR_ANTI_ALIASING", "fxaa");
-    if (name == "fxaa")
-      return AntiAliasing::kFxaa;
-    if (name == "smaa")
-      return AntiAliasing::kSmaa;
-    if (name != "off")
+bool OpenXrBackend::FxaaEnabled() const {
+  static const bool enabled = [] {
+    const std::string mode = EnvString("MOCKTAIL_VR_ANTI_ALIASING", "fxaa");
+    if (mode != "fxaa" && mode != "off")
       Log("  [vr-backend] unknown MOCKTAIL_VR_ANTI_ALIASING '%s'; using off\n",
-          name.c_str());
-    return AntiAliasing::kOff;
+          mode.c_str());
+    return mode == "fxaa";
   }();
-  return graphics_api_ == VrGraphicsApi::kVulkan ? mode : AntiAliasing::kOff;
-}
-
-// One fullscreen triangle, no vertex input, no blending; viewport and scissor
-// are set per draw.
-bool OpenXrBackend::CreateFullscreenPipelineLocked(VkShaderModule vertex,
-                                                   VkShaderModule fragment,
-                                                   VkPipelineLayout layout,
-                                                   VkRenderPass render_pass,
-                                                   VkPipeline *pipeline) {
-  VkPipelineShaderStageCreateInfo stages[2]{};
-  stages[0].sType = stages[1].sType =
-      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stages[0].module = vertex;
-  stages[0].pName = "main";
-  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  stages[1].module = fragment;
-  stages[1].pName = "main";
-  VkPipelineVertexInputStateCreateInfo vertex_input{};
-  vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-  VkPipelineInputAssemblyStateCreateInfo assembly{};
-  assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  VkPipelineViewportStateCreateInfo viewport{};
-  viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-  viewport.viewportCount = viewport.scissorCount = 1;
-  VkPipelineRasterizationStateCreateInfo raster{};
-  raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-  raster.polygonMode = VK_POLYGON_MODE_FILL;
-  raster.cullMode = VK_CULL_MODE_NONE;
-  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-  raster.lineWidth = 1.0f;
-  VkPipelineMultisampleStateCreateInfo multisample{};
-  multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  VkPipelineColorBlendAttachmentState blend{};
-  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-  VkPipelineColorBlendStateCreateInfo color{};
-  color.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  color.attachmentCount = 1;
-  color.pAttachments = &blend;
-  const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                            VK_DYNAMIC_STATE_SCISSOR};
-  VkPipelineDynamicStateCreateInfo dynamic{};
-  dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-  dynamic.dynamicStateCount = 2;
-  dynamic.pDynamicStates = dynamic_states;
-  VkGraphicsPipelineCreateInfo info{};
-  info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  info.stageCount = 2;
-  info.pStages = stages;
-  info.pVertexInputState = &vertex_input;
-  info.pInputAssemblyState = &assembly;
-  info.pViewportState = &viewport;
-  info.pRasterizationState = &raster;
-  info.pMultisampleState = &multisample;
-  info.pColorBlendState = &color;
-  info.pDynamicState = &dynamic;
-  info.layout = layout;
-  info.renderPass = render_pass;
-  if (vk_->CreateGraphicsPipelines(vk_device_, VK_NULL_HANDLE, 1, &info,
-                                   nullptr, pipeline) != VK_SUCCESS) {
-    *pipeline = VK_NULL_HANDLE;
-    return false;
-  }
-  return true;
+  return enabled && graphics_api_ == VrGraphicsApi::kVulkan;
 }
 
 bool OpenXrBackend::CreateFxaaPipelineLocked(VkFormat target_format) {
@@ -3833,17 +4967,69 @@ bool OpenXrBackend::CreateFxaaPipelineLocked(VkFormat target_format) {
       VK_SUCCESS)
     return false;
 
-  if (!CreateFullscreenPipelineLocked(fxaa_.vertex, fxaa_.fragment,
-                                      fxaa_.layout, fxaa_.render_pass,
-                                      &fxaa_.pipeline))
+  VkPipelineShaderStageCreateInfo stages[2]{};
+  stages[0].sType = stages[1].sType =
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = fxaa_.vertex;
+  stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fxaa_.fragment;
+  stages[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vertex_input{};
+  vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  VkPipelineInputAssemblyStateCreateInfo assembly{};
+  assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewport{};
+  viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  viewport.viewportCount = viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster{};
+  raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample{};
+  multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState blend{};
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo color{};
+  color.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  color.attachmentCount = 1;
+  color.pAttachments = &blend;
+  const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                            VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic{};
+  dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+  VkGraphicsPipelineCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  info.stageCount = 2;
+  info.pStages = stages;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pColorBlendState = &color;
+  info.pDynamicState = &dynamic;
+  info.layout = fxaa_.layout;
+  info.renderPass = fxaa_.render_pass;
+  if (vk_->CreateGraphicsPipelines(vk_device_, VK_NULL_HANDLE, 1, &info,
+                                   nullptr, &fxaa_.pipeline) != VK_SUCCESS) {
+    fxaa_.pipeline = VK_NULL_HANDLE;
     return false;
+  }
   fxaa_.target_format = target_format;
   return true;
 }
 
 bool OpenXrBackend::PrepareFxaaLocked() {
-  if (AntiAliasingMode() == AntiAliasing::kOff || fxaa_.failed ||
-      vk_ == nullptr)
+  if (!FxaaEnabled() || fxaa_.failed || vk_ == nullptr)
     return false;
   // Sampling needs SAMPLED usage on the guest's eye images.
   for (int eye = 0; eye < 2; ++eye) {
@@ -3854,8 +5040,8 @@ bool OpenXrBackend::PrepareFxaaLocked() {
   }
   const auto fail = [this](const char *what) {
     fxaa_.failed = true;
-    Log("  [vr-backend] anti-aliasing unavailable (%s); copying the eyes "
-        "without it\n",
+    Log("  [vr-backend] FXAA unavailable (%s); copying the eyes without "
+        "anti-aliasing\n",
         what);
     return false;
   };
@@ -3934,11 +5120,16 @@ bool OpenXrBackend::PrepareFxaaLocked() {
     write.pImageInfo = &image;
     vk_->UpdateDescriptorSets(vk_device_, 1, &write, 0, nullptr);
   }
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    Log("  [vr-backend] FXAA anti-aliasing on (%ux%u per eye)\n",
+        eye_swapchains_[0].width, eye_swapchains_[0].height);
+  }
   return true;
 }
 
-void OpenXrBackend::RecordFilteredEyesLocked(VkCommandBuffer command,
-                                             bool smaa) {
+void OpenXrBackend::RecordFxaaEyesLocked(VkCommandBuffer command) {
   const auto barrier = [&](VkImage image, VkImageLayout from, VkImageLayout to,
                            VkAccessFlags src_access, VkAccessFlags dst_access,
                            VkPipelineStageFlags src_stage,
@@ -3970,62 +5161,31 @@ void OpenXrBackend::RecordFilteredEyesLocked(VkCommandBuffer command,
             0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-    // One fullscreen draw into `framebuffer`; the attachment is cleared when
-    // the render pass clears.
-    const auto draw = [&](VkRenderPass render_pass, VkFramebuffer framebuffer,
-                          VkPipeline pipeline, VkPipelineLayout layout,
-                          VkDescriptorSet set, VkShaderStageFlags push_stages,
-                          const void *push, std::uint32_t push_size) {
-      const VkClearValue clear{};
-      VkRenderPassBeginInfo begin{};
-      begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-      begin.renderPass = render_pass;
-      begin.framebuffer = framebuffer;
-      begin.renderArea.extent = {swapchain.width, swapchain.height};
-      begin.clearValueCount = 1;
-      begin.pClearValues = &clear;
-      vk_->CmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
-      vk_->CmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-      vk_->CmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                 layout, 0, 1, &set, 0, nullptr);
-      const VkViewport viewport{0.f, 0.f, float(swapchain.width),
-                                float(swapchain.height), 0.f, 1.f};
-      const VkRect2D scissor{{0, 0}, {swapchain.width, swapchain.height}};
-      vk_->CmdSetViewport(command, 0, 1, &viewport);
-      vk_->CmdSetScissor(command, 0, 1, &scissor);
-      vk_->CmdPushConstants(command, layout, push_stages, 0, push_size, push);
-      vk_->CmdDraw(command, 3, 1, 0, 0);
-      vk_->CmdEndRenderPass(command);
-    };
-    const VkFramebuffer target =
-        fxaa_.framebuffers[eye][swapchain.acquired_index];
-    if (smaa) {
-      struct {
-        float metrics[4];
-        std::uint32_t linearize;
-      } push{{1.f / float(binding.width), 1.f / float(binding.height),
-              float(binding.width), float(binding.height)},
-             linearize ? 1u : 0u};
-      constexpr VkShaderStageFlags stages =
-          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-      draw(smaa_.edges.render_pass, smaa_.edge_framebuffers[eye],
-           smaa_.edges.pipeline, smaa_.edges.layout, smaa_.edges.sets[eye],
-           stages, &push, sizeof(push));
-      draw(smaa_.weights.render_pass, smaa_.weight_framebuffers[eye],
-           smaa_.weights.pipeline, smaa_.weights.layout,
-           smaa_.weights.sets[eye], stages, &push, sizeof(push));
-      draw(fxaa_.render_pass, target, smaa_.blend.pipeline,
-           smaa_.blend.layout, smaa_.blend.sets[eye], stages, &push,
-           sizeof(push));
-    } else {
-      struct {
-        float texel[2];
-        std::uint32_t linearize;
-      } push{{1.f / float(binding.width), 1.f / float(binding.height)},
-             linearize ? 1u : 0u};
-      draw(fxaa_.render_pass, target, fxaa_.pipeline, fxaa_.layout,
-           fxaa_.sets[eye], VK_SHADER_STAGE_FRAGMENT_BIT, &push, sizeof(push));
-    }
+    VkRenderPassBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    begin.renderPass = fxaa_.render_pass;
+    begin.framebuffer = fxaa_.framebuffers[eye][swapchain.acquired_index];
+    begin.renderArea.extent = {swapchain.width, swapchain.height};
+    vk_->CmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    vk_->CmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                         fxaa_.pipeline);
+    vk_->CmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                               fxaa_.layout, 0, 1, &fxaa_.sets[eye], 0,
+                               nullptr);
+    const VkViewport viewport{0.f, 0.f, float(swapchain.width),
+                              float(swapchain.height), 0.f, 1.f};
+    const VkRect2D scissor{{0, 0}, {swapchain.width, swapchain.height}};
+    vk_->CmdSetViewport(command, 0, 1, &viewport);
+    vk_->CmdSetScissor(command, 0, 1, &scissor);
+    struct {
+      float texel[2];
+      std::uint32_t linearize;
+    } push{{1.f / float(binding.width), 1.f / float(binding.height)},
+           linearize ? 1u : 0u};
+    vk_->CmdPushConstants(command, fxaa_.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(push), &push);
+    vk_->CmdDraw(command, 3, 1, 0, 0);
+    vk_->CmdEndRenderPass(command);
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT;
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -4046,452 +5206,6 @@ void OpenXrBackend::RecordFilteredEyesLocked(VkCommandBuffer command,
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, stage,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
   }
-}
-
-bool OpenXrBackend::CreateSmaaImageLocked(VkFormat format, std::uint32_t width,
-                                          std::uint32_t height,
-                                          VkImageUsageFlags usage,
-                                          SmaaImage *out) {
-  VkImageCreateInfo info{};
-  info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  info.imageType = VK_IMAGE_TYPE_2D;
-  info.format = format;
-  info.extent = {width, height, 1};
-  info.mipLevels = info.arrayLayers = 1;
-  info.samples = VK_SAMPLE_COUNT_1_BIT;
-  info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.usage = usage;
-  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vk_->CreateImage(vk_device_, &info, nullptr, &out->image) != VK_SUCCESS) {
-    out->image = VK_NULL_HANDLE;
-    return false;
-  }
-  VkMemoryRequirements requirements{};
-  vk_->GetImageMemoryRequirements(vk_device_, out->image, &requirements);
-  VkPhysicalDeviceMemoryProperties properties{};
-  vk_->GetPhysicalDeviceMemoryProperties(vk_physical_device_, &properties);
-  std::uint32_t type = UINT32_MAX;
-  for (const bool local : {true, false}) {
-    for (std::uint32_t t = 0; t < properties.memoryTypeCount && type == UINT32_MAX;
-         ++t) {
-      if ((requirements.memoryTypeBits & (1u << t)) &&
-          (!local || (properties.memoryTypes[t].propertyFlags &
-                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
-        type = t;
-    }
-  }
-  VkMemoryAllocateInfo allocation{};
-  allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  allocation.allocationSize = requirements.size;
-  allocation.memoryTypeIndex = type;
-  if (type == UINT32_MAX ||
-      vk_->AllocateMemory(vk_device_, &allocation, nullptr, &out->memory) !=
-          VK_SUCCESS) {
-    out->memory = VK_NULL_HANDLE;
-    return false;
-  }
-  if (vk_->BindImageMemory(vk_device_, out->image, out->memory, 0) !=
-      VK_SUCCESS)
-    return false;
-  VkImageViewCreateInfo view{};
-  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  view.image = out->image;
-  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view.format = format;
-  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vk_->CreateImageView(vk_device_, &view, nullptr, &out->view) !=
-      VK_SUCCESS) {
-    out->view = VK_NULL_HANDLE;
-    return false;
-  }
-  return true;
-}
-
-void OpenXrBackend::DestroySmaaImageLocked(SmaaImage *image) {
-  if (vk_ != nullptr && vk_device_ != VK_NULL_HANDLE) {
-    if (image->view) vk_->DestroyImageView(vk_device_, image->view, nullptr);
-    if (image->image) vk_->DestroyImage(vk_device_, image->image, nullptr);
-    if (image->memory) vk_->FreeMemory(vk_device_, image->memory, nullptr);
-  }
-  *image = {};
-}
-
-// Once per device: copies a lookup table into its image and waits for it.
-bool OpenXrBackend::UploadSmaaLookupLocked(SmaaImage *image,
-                                           std::uint32_t width,
-                                           std::uint32_t height,
-                                           const void *bytes,
-                                           std::size_t size) {
-  VkBuffer staging = VK_NULL_HANDLE;
-  VkDeviceMemory memory = VK_NULL_HANDLE;
-  const auto release = [&] {
-    if (staging) vk_->DestroyBuffer(vk_device_, staging, nullptr);
-    if (memory) vk_->FreeMemory(vk_device_, memory, nullptr);
-  };
-  VkBufferCreateInfo buffer{};
-  buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  buffer.size = size;
-  buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  if (vk_->CreateBuffer(vk_device_, &buffer, nullptr, &staging) != VK_SUCCESS)
-    return false;
-  VkMemoryRequirements requirements{};
-  vk_->GetBufferMemoryRequirements(vk_device_, staging, &requirements);
-  VkPhysicalDeviceMemoryProperties properties{};
-  vk_->GetPhysicalDeviceMemoryProperties(vk_physical_device_, &properties);
-  const auto flags =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  std::uint32_t type = UINT32_MAX;
-  for (std::uint32_t t = 0; t < properties.memoryTypeCount; ++t)
-    if ((requirements.memoryTypeBits & (1u << t)) &&
-        (properties.memoryTypes[t].propertyFlags & flags) == flags) {
-      type = t;
-      break;
-    }
-  VkMemoryAllocateInfo allocation{};
-  allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  allocation.allocationSize = requirements.size;
-  allocation.memoryTypeIndex = type;
-  void *mapped = nullptr;
-  if (type == UINT32_MAX ||
-      vk_->AllocateMemory(vk_device_, &allocation, nullptr, &memory) !=
-          VK_SUCCESS ||
-      vk_->BindBufferMemory(vk_device_, staging, memory, 0) != VK_SUCCESS ||
-      vk_->MapMemory(vk_device_, memory, 0, size, 0, &mapped) != VK_SUCCESS) {
-    release();
-    return false;
-  }
-  std::memcpy(mapped, bytes, size);
-  vk_->UnmapMemory(vk_device_, memory);
-
-  VkCommandBufferBeginInfo begin{};
-  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vk_->ResetCommandBuffer(copy_command_, 0) != VK_SUCCESS ||
-      vk_->BeginCommandBuffer(copy_command_, &begin) != VK_SUCCESS) {
-    release();
-    return false;
-  }
-  VkImageMemoryBarrier barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex =
-      VK_QUEUE_FAMILY_IGNORED;
-  barrier.image = image->image;
-  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                          nullptr, 1, &barrier);
-  VkBufferImageCopy region{};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {width, height, 1};
-  vk_->CmdCopyBufferToImage(copy_command_, staging, image->image,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
-                          0, nullptr, 1, &barrier);
-  VkSubmitInfo submit{};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &copy_command_;
-  const bool uploaded =
-      vk_->EndCommandBuffer(copy_command_) == VK_SUCCESS &&
-      vk_->ResetFences(vk_device_, 1, &copy_fence_) == VK_SUCCESS &&
-      SubmitHostQueue(vk_->QueueSubmit, vk_device_, vk_graphics_queue_, 1,
-                      &submit, copy_fence_) == VK_SUCCESS &&
-      vk_->WaitForFences(vk_device_, 1, &copy_fence_, VK_TRUE,
-                         2'000'000'000ULL) == VK_SUCCESS;
-  if (!uploaded)
-    (void)IdleHostDevice(vk_->DeviceWaitIdle, vk_device_);
-  release();
-  return uploaded;
-}
-
-bool OpenXrBackend::CreateSmaaPipelinesLocked() {
-  if (smaa_.blend.pipeline != VK_NULL_HANDLE &&
-      smaa_.target_format == fxaa_.target_format)
-    return true;
-  if (smaa_.modules.empty()) {
-    const std::pair<const std::uint32_t *, std::size_t> sources[] = {
-        {kSmaaEdgesVertexSpirv, sizeof(kSmaaEdgesVertexSpirv)},
-        {kSmaaEdgesFragmentSpirv, sizeof(kSmaaEdgesFragmentSpirv)},
-        {kSmaaWeightsVertexSpirv, sizeof(kSmaaWeightsVertexSpirv)},
-        {kSmaaWeightsFragmentSpirv, sizeof(kSmaaWeightsFragmentSpirv)},
-        {kSmaaBlendVertexSpirv, sizeof(kSmaaBlendVertexSpirv)},
-        {kSmaaBlendFragmentSpirv, sizeof(kSmaaBlendFragmentSpirv)}};
-    for (const auto &[words, bytes] : sources) {
-      VkShaderModuleCreateInfo info{};
-      info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-      info.codeSize = bytes;
-      info.pCode = words;
-      VkShaderModule module = VK_NULL_HANDLE;
-      if (vk_->CreateShaderModule(vk_device_, &info, nullptr, &module) !=
-          VK_SUCCESS)
-        return false;
-      smaa_.modules.push_back(module);
-    }
-  }
-  if (smaa_.pool == VK_NULL_HANDLE) {
-    // Per eye: 1 edge input, 3 weight inputs, 2 blend inputs.
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12};
-    VkDescriptorPoolCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    info.maxSets = 6;
-    info.poolSizeCount = 1;
-    info.pPoolSizes = &size;
-    if (vk_->CreateDescriptorPool(vk_device_, &info, nullptr, &smaa_.pool) !=
-        VK_SUCCESS)
-      return false;
-  }
-  const VkSampler samplers[3] = {fxaa_.sampler, fxaa_.sampler, fxaa_.sampler};
-  const auto make_layout = [&](SmaaPass *pass, std::uint32_t inputs) {
-    if (pass->layout != VK_NULL_HANDLE)
-      return true;
-    VkDescriptorSetLayoutBinding bindings[3]{};
-    for (std::uint32_t i = 0; i < inputs; ++i) {
-      bindings[i].binding = i;
-      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-      bindings[i].descriptorCount = 1;
-      bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-      bindings[i].pImmutableSamplers = &samplers[i];
-    }
-    VkDescriptorSetLayoutCreateInfo set_info{};
-    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_info.bindingCount = inputs;
-    set_info.pBindings = bindings;
-    if (vk_->CreateDescriptorSetLayout(vk_device_, &set_info, nullptr,
-                                       &pass->set_layout) != VK_SUCCESS)
-      return false;
-    const VkDescriptorSetLayout layouts[2] = {pass->set_layout,
-                                              pass->set_layout};
-    VkDescriptorSetAllocateInfo allocate{};
-    allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocate.descriptorPool = smaa_.pool;
-    allocate.descriptorSetCount = 2;
-    allocate.pSetLayouts = layouts;
-    if (vk_->AllocateDescriptorSets(vk_device_, &allocate, pass->sets) !=
-        VK_SUCCESS)
-      return false;
-    // metrics (vec4) and linearize (uint), read by both stages.
-    VkPushConstantRange range{
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-        5 * sizeof(std::uint32_t)};
-    VkPipelineLayoutCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    info.setLayoutCount = 1;
-    info.pSetLayouts = &pass->set_layout;
-    info.pushConstantRangeCount = 1;
-    info.pPushConstantRanges = &range;
-    return vk_->CreatePipelineLayout(vk_device_, &info, nullptr,
-                                     &pass->layout) == VK_SUCCESS;
-  };
-  if (!make_layout(&smaa_.edges, 1) || !make_layout(&smaa_.weights, 3) ||
-      !make_layout(&smaa_.blend, 2))
-    return false;
-  // The edge and weight images are cleared, written, then read by the next
-  // pass. The incoming dependency also orders the clear after last frame's
-  // reads of the same image.
-  const auto make_pass = [&](SmaaPass *pass, VkFormat format) {
-    if (pass->render_pass != VK_NULL_HANDLE)
-      return true;
-    VkAttachmentDescription attachment{};
-    attachment.format = format;
-    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkAttachmentReference reference{0,
-                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &reference;
-    VkSubpassDependency dependencies[2]{};
-    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[0].dstSubpass = 0;
-    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[0].dstStageMask =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].srcSubpass = 0;
-    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[1].srcStageMask =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    VkRenderPassCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    info.attachmentCount = 1;
-    info.pAttachments = &attachment;
-    info.subpassCount = 1;
-    info.pSubpasses = &subpass;
-    info.dependencyCount = 2;
-    info.pDependencies = dependencies;
-    return vk_->CreateRenderPass(vk_device_, &info, nullptr,
-                                 &pass->render_pass) == VK_SUCCESS;
-  };
-  if (!make_pass(&smaa_.edges, VK_FORMAT_R8G8_UNORM) ||
-      !make_pass(&smaa_.weights, VK_FORMAT_R8G8B8A8_UNORM))
-    return false;
-  if (smaa_.edges.pipeline == VK_NULL_HANDLE &&
-      !CreateFullscreenPipelineLocked(smaa_.modules[0], smaa_.modules[1],
-                                      smaa_.edges.layout,
-                                      smaa_.edges.render_pass,
-                                      &smaa_.edges.pipeline))
-    return false;
-  if (smaa_.weights.pipeline == VK_NULL_HANDLE &&
-      !CreateFullscreenPipelineLocked(smaa_.modules[2], smaa_.modules[3],
-                                      smaa_.weights.layout,
-                                      smaa_.weights.render_pass,
-                                      &smaa_.weights.pipeline))
-    return false;
-  // The last pass writes the swapchain through FXAA's render pass.
-  if (smaa_.blend.pipeline != VK_NULL_HANDLE)
-    vk_->DestroyPipeline(vk_device_, smaa_.blend.pipeline, nullptr);
-  smaa_.blend.pipeline = VK_NULL_HANDLE;
-  if (!CreateFullscreenPipelineLocked(smaa_.modules[4], smaa_.modules[5],
-                                      smaa_.blend.layout, fxaa_.render_pass,
-                                      &smaa_.blend.pipeline))
-    return false;
-  smaa_.target_format = fxaa_.target_format;
-  return true;
-}
-
-bool OpenXrBackend::PrepareSmaaLocked() {
-  if (smaa_.failed)
-    return false;
-  const auto fail = [this](const char *what) {
-    smaa_.failed = true;
-    Log("  [vr-backend] SMAA unavailable (%s); using FXAA\n", what);
-    return false;
-  };
-  if (!CreateSmaaPipelinesLocked())
-    return fail("pipelines");
-  if (smaa_.area.image == VK_NULL_HANDLE) {
-    constexpr VkImageUsageFlags usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!CreateSmaaImageLocked(VK_FORMAT_R8G8_UNORM, AREATEX_WIDTH,
-                               AREATEX_HEIGHT, usage, &smaa_.area) ||
-        !UploadSmaaLookupLocked(&smaa_.area, AREATEX_WIDTH, AREATEX_HEIGHT,
-                                areaTexBytes, sizeof(areaTexBytes)) ||
-        !CreateSmaaImageLocked(VK_FORMAT_R8_UNORM, SEARCHTEX_WIDTH,
-                               SEARCHTEX_HEIGHT, usage, &smaa_.search) ||
-        !UploadSmaaLookupLocked(&smaa_.search, SEARCHTEX_WIDTH,
-                                SEARCHTEX_HEIGHT, searchTexBytes,
-                                sizeof(searchTexBytes)))
-      return fail("lookup textures");
-  }
-  const auto write = [&](VkDescriptorSet set, std::uint32_t binding,
-                         VkImageView view) {
-    VkDescriptorImageInfo image{};
-    image.imageView = view;
-    image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet info{};
-    info.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    info.dstSet = set;
-    info.dstBinding = binding;
-    info.descriptorCount = 1;
-    info.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    info.pImageInfo = &image;
-    vk_->UpdateDescriptorSets(vk_device_, 1, &info, 0, nullptr);
-  };
-  const std::uint32_t width = eyes_[0].width, height = eyes_[0].height;
-  if (smaa_.width != width || smaa_.height != height) {
-    // The images and their sets may still be in use.
-    WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
-    DestroySmaaTargetsLocked();
-    constexpr VkImageUsageFlags usage =
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    for (int eye = 0; eye < 2; ++eye) {
-      if (!CreateSmaaImageLocked(VK_FORMAT_R8G8_UNORM, width, height, usage,
-                                 &smaa_.edge_images[eye]) ||
-          !CreateSmaaImageLocked(VK_FORMAT_R8G8B8A8_UNORM, width, height,
-                                 usage, &smaa_.weight_images[eye]))
-        return fail("intermediate images");
-      const auto framebuffer = [&](VkRenderPass render_pass, VkImageView view,
-                                   VkFramebuffer *out) {
-        VkFramebufferCreateInfo info{};
-        info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        info.renderPass = render_pass;
-        info.attachmentCount = 1;
-        info.pAttachments = &view;
-        info.width = width;
-        info.height = height;
-        info.layers = 1;
-        return vk_->CreateFramebuffer(vk_device_, &info, nullptr, out) ==
-               VK_SUCCESS;
-      };
-      if (!framebuffer(smaa_.edges.render_pass, smaa_.edge_images[eye].view,
-                       &smaa_.edge_framebuffers[eye]) ||
-          !framebuffer(smaa_.weights.render_pass,
-                       smaa_.weight_images[eye].view,
-                       &smaa_.weight_framebuffers[eye]))
-        return fail("framebuffers");
-      write(smaa_.weights.sets[eye], 0, smaa_.edge_images[eye].view);
-      write(smaa_.weights.sets[eye], 1, smaa_.area.view);
-      write(smaa_.weights.sets[eye], 2, smaa_.search.view);
-      write(smaa_.blend.sets[eye], 1, smaa_.weight_images[eye].view);
-    }
-    smaa_.width = width;
-    smaa_.height = height;
-  }
-  for (int eye = 0; eye < 2; ++eye) {
-    if (smaa_.bound_sources[eye] == fxaa_.source_views[eye])
-      continue;
-    WaitAsyncSubmissionsLocked(VK_NULL_HANDLE);
-    write(smaa_.edges.sets[eye], 0, fxaa_.source_views[eye]);
-    write(smaa_.blend.sets[eye], 0, fxaa_.source_views[eye]);
-    smaa_.bound_sources[eye] = fxaa_.source_views[eye];
-  }
-  return true;
-}
-
-void OpenXrBackend::DestroySmaaTargetsLocked() {
-  for (int eye = 0; eye < 2; ++eye) {
-    if (vk_ != nullptr && vk_device_ != VK_NULL_HANDLE) {
-      if (smaa_.edge_framebuffers[eye])
-        vk_->DestroyFramebuffer(vk_device_, smaa_.edge_framebuffers[eye],
-                                nullptr);
-      if (smaa_.weight_framebuffers[eye])
-        vk_->DestroyFramebuffer(vk_device_, smaa_.weight_framebuffers[eye],
-                                nullptr);
-    }
-    smaa_.edge_framebuffers[eye] = smaa_.weight_framebuffers[eye] =
-        VK_NULL_HANDLE;
-    DestroySmaaImageLocked(&smaa_.edge_images[eye]);
-    DestroySmaaImageLocked(&smaa_.weight_images[eye]);
-  }
-  smaa_.width = smaa_.height = 0;
-}
-
-void OpenXrBackend::DestroySmaaLocked() {
-  DestroySmaaTargetsLocked();
-  DestroySmaaImageLocked(&smaa_.area);
-  DestroySmaaImageLocked(&smaa_.search);
-  if (vk_ != nullptr && vk_device_ != VK_NULL_HANDLE) {
-    for (SmaaPass *pass : {&smaa_.edges, &smaa_.weights, &smaa_.blend}) {
-      if (pass->pipeline) vk_->DestroyPipeline(vk_device_, pass->pipeline, nullptr);
-      if (pass->render_pass)
-        vk_->DestroyRenderPass(vk_device_, pass->render_pass, nullptr);
-      if (pass->layout)
-        vk_->DestroyPipelineLayout(vk_device_, pass->layout, nullptr);
-      if (pass->set_layout)
-        vk_->DestroyDescriptorSetLayout(vk_device_, pass->set_layout, nullptr);
-    }
-    if (smaa_.pool) vk_->DestroyDescriptorPool(vk_device_, smaa_.pool, nullptr);
-    for (const VkShaderModule module : smaa_.modules)
-      vk_->DestroyShaderModule(vk_device_, module, nullptr);
-  }
-  smaa_ = {};
 }
 
 void OpenXrBackend::DestroyFxaaTargetsLocked() {
@@ -4516,13 +5230,10 @@ void OpenXrBackend::ForgetFxaaSourceLocked(VkImage image) {
       vk_->DestroyImageView(vk_device_, fxaa_.source_views[eye], nullptr);
     fxaa_.source_views[eye] = VK_NULL_HANDLE;
     fxaa_.sources[eye] = VK_NULL_HANDLE;
-    // A new view can reuse the old handle; force the SMAA sets to rebind.
-    smaa_.bound_sources[eye] = VK_NULL_HANDLE;
   }
 }
 
 void OpenXrBackend::DestroyFxaaLocked() {
-  DestroySmaaLocked();  // uses FXAA's sampler, render pass and views
   DestroyFxaaTargetsLocked();
   ForgetFxaaSourceLocked(fxaa_.sources[0]);
   ForgetFxaaSourceLocked(fxaa_.sources[1]);
@@ -4762,7 +5473,7 @@ VkResult OpenXrBackend::MirrorDesktop(VkQueue queue,
     b.srcAccessMask = b.dstAccessMask;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
   }
-  vk_->CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  vk_->CmdPipelineBarrier(copy_command_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                           nullptr, 2, barriers);
   if (vk_->EndCommandBuffer(command) != VK_SUCCESS)
@@ -4953,9 +5664,34 @@ bool OpenXrBackend::CaptureEyeEvidence(VkQueue queue, int eye) {
 // inert while no backend is armed; the adapter falls back to its plain host
 // loader path whenever a hook returns false.
 extern "C" {
+bool mocktail_vr_xr_fsr3_inputs_available() {
+  return mocktail::vr::g_fsr3_inputs_available.load(std::memory_order_acquire);
+}
+bool mocktail_vr_xr_fsr3_inputs_enabled() {
+  return mocktail::vr::g_fsr3_capture_active.load(std::memory_order_acquire);
+}
+void mocktail_vr_xr_fsr3_scene_end(VkDevice device,VkCommandBuffer command,
+    const mocktail::vr::TemporalSceneInputs* inputs) {
+  if(!inputs)return;
+  try {if(auto* backend=mocktail::vr::ActiveVrBackend())backend->CaptureFsr3Scene(device,command,*inputs);}
+  catch(const std::exception& e){std::fprintf(stderr,"  [vr-fsr3] scene capture failed: %s\n",e.what());}
+}
+void mocktail_vr_xr_fsr3_motion_end(VkDevice device,VkCommandBuffer command,
+    const mocktail::vr::TemporalMotionInputs* inputs) {
+  if(!inputs)return;
+  try {if(auto* backend=mocktail::vr::ActiveVrBackend())backend->CaptureFsr3Motion(device,command,*inputs);}
+  catch(const std::exception& e){std::fprintf(stderr,"  [vr-fsr3] motion capture failed: %s\n",e.what());}
+}
+void mocktail_vr_xr_pass_timing_reporter(void(*reporter)(VkDevice,VkQueue)) {
+  mocktail::vr::g_pass_timing_reporter.store(reporter,std::memory_order_release);
+}
 void mocktail_vr_xr_device_idle_adapter(
     mocktail::vr::SynchronizedDeviceIdle idle) {
   mocktail::vr::g_device_idle_adapter.store(idle, std::memory_order_release);
+}
+void mocktail_vr_xr_queue_operation_adapter(
+    mocktail::vr::SynchronizedQueueOperation operation) {
+  mocktail::vr::g_queue_operation_adapter.store(operation, std::memory_order_release);
 }
 void mocktail_vr_xr_queue_submit_adapter(
     mocktail::vr::SynchronizedQueueSubmit submit) {
@@ -4982,15 +5718,45 @@ bool mocktail_vr_xr_create_vulkan_device(
                                      device, result);
 }
 
-void mocktail_vr_xr_note_instance_destroyed(VkInstance instance) {
-  if (auto* backend = mocktail::vr::ActiveVrBackend()) backend->NoteInstanceDestroyed(instance);
+bool mocktail_vr_xr_foveation_enabled(VkDevice device) {
+  auto* backend = mocktail::vr::ActiveVrBackend();
+  return backend && backend->FoveationEnabled(device);
+}
+bool mocktail_vr_xr_foveation_focus(VkDevice device,VkFramebuffer framebuffer,float* x,float* y,std::uint64_t* frame,int* eye,int* level) {
+  auto* backend=mocktail::vr::ActiveVrBackend();
+  return backend && backend->FoveationFocus(device,framebuffer,x,y,frame,eye,level);
+}
+bool mocktail_vr_xr_foveation_render_focus(VkDevice device,VkFramebuffer framebuffer,
+    std::uint32_t width,std::uint32_t height,float* x,float* y,float* radius,
+    std::uint64_t* frame,int* eye,int* level) {
+  auto* backend=mocktail::vr::ActiveVrBackend();
+  return backend && backend->FoveationRenderFocus(device,framebuffer,width,height,x,y,radius,frame,eye,level);
+}
+bool mocktail_vr_xr_foveation_snapshot(VkDevice device,float* centers,float* radius,std::uint64_t* frame,int* level) {
+  auto* backend=mocktail::vr::ActiveVrBackend();
+  return backend && backend->FoveationSnapshot(device,centers,radius,frame,level);
+}
+bool mocktail_vr_xr_foveation_host_copy_enabled(VkDevice device) {
+  auto* backend=mocktail::vr::ActiveVrBackend();
+  return backend && backend->FoveationHostCopyEnabled(device);
+}
+VkImageView mocktail_vr_xr_foveation_view(VkDevice device, VkFramebuffer framebuffer) {
+  auto* backend = mocktail::vr::ActiveVrBackend();
+  return backend ? backend->FoveationViewForFramebuffer(device, framebuffer) : VK_NULL_HANDLE;
+}
+VkExtent2D mocktail_vr_xr_foveation_extent(VkDevice device) {
+  auto* backend = mocktail::vr::ActiveVrBackend();
+  return backend ? backend->FoveationMapExtent(device) : VkExtent2D{};
 }
 
-void mocktail_vr_xr_note_device_destroyed(VkDevice device) {
+bool mocktail_vr_xr_note_instance_destroyed(VkInstance instance) {
+  if (auto* backend = mocktail::vr::ActiveVrBackend()) return backend->NoteInstanceDestroyed(instance);
+  return false;
+}
+
+bool mocktail_vr_xr_note_device_destroyed(VkDevice device) {
   auto* backend = mocktail::vr::ActiveVrBackend();
-  if (backend != nullptr) {
-    backend->NoteDeviceDestroyed(device);
-  }
+  return backend != nullptr && backend->NoteDeviceDestroyed(device);
 }
 
 void mocktail_vr_xr_note_queue(VkDevice device, VkQueue queue,
@@ -5139,6 +5905,16 @@ VkImageLayout mocktail_vr_xr_desktop_barrier(VkCommandBuffer command,
     return backend->NormalizeDesktopBarrier(command, image, source, destination,
                                             old_layout, new_layout);
   return new_layout;
+}
+void mocktail_vr_xr_desktop_barriers(VkCommandBuffer command, unsigned count,
+                                    VkImageMemoryBarrier* barriers) {
+  if (auto* backend = mocktail::vr::ActiveVrBackend())
+    backend->NormalizeDesktopBarriers(command, count, barriers);
+}
+void mocktail_vr_xr_desktop_barriers2(VkCommandBuffer command, unsigned count,
+                                     VkImageMemoryBarrier2* barriers) {
+  if (auto* backend = mocktail::vr::ActiveVrBackend())
+    backend->NormalizeDesktopBarriers(command, count, barriers);
 }
 VkResult mocktail_vr_desktop_present(VkQueue queue,
                                      const VkPresentInfoKHR *info,

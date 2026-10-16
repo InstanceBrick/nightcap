@@ -113,6 +113,9 @@ add_library(stub_vulkan SHARED
   ${CMAKE_SOURCE_DIR}/src/graphics/texture_override.cc
 )
 configure_stub(stub_vulkan "libvulkan.so")
+if(MOCKTAIL_ENABLE_FSR3)
+  target_compile_definitions(stub_vulkan PRIVATE MOCKTAIL_ENABLE_FSR3=1)
+endif()
 target_include_directories(stub_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/include)
 pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
 pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng)

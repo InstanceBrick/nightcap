@@ -631,7 +631,13 @@ TEST(RobloxExperienceCompositionTest,
       env->GetStaticMethodID(native_gl_class, "gameDidLeave", "()V");
   ASSERT_NE(game_did_leave, nullptr);
   env->CallStaticVoidMethod(native_gl_class, game_did_leave);
-  ASSERT_TRUE(composition.DrainLaunchRequests().ok());
+  // Present notification can precede launch-worker completion. Drain until
+  // the owned worker is reaped and the queued lifecycle callback is consumed.
+  for (int attempt = 0; attempt < 1000 &&
+       !composition.Snapshot().returned_to_lua_app; ++attempt) {
+    ASSERT_TRUE(composition.DrainLaunchRequests().ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   EXPECT_EQ(probe.starts.load(), 1);
   EXPECT_EQ(composition.Snapshot().state, GameSessionState::kReturnedToLuaApp);
   EXPECT_TRUE(composition.Snapshot().returned_to_lua_app);
@@ -728,8 +734,19 @@ TEST(RobloxExperienceCompositionTest,
   g_probe = nullptr;
 }
 
-TEST(RobloxExperienceCompositionTest,
+class RobloxExperienceControlledSwitchTest : public testing::TestWithParam<bool> {};
+TEST_P(RobloxExperienceControlledSwitchTest,
      ConsumesControlledStartAndSwitchesActiveGame) {
+  struct LeaveContractEnvironment {
+    const char* name = "MOCKTAIL_GAME_LEAVE_COMPLETES_WITHOUT_LUA_CALLBACK";
+    bool had_value = std::getenv(name) != nullptr;
+    std::string previous = had_value ? std::getenv(name) : "";
+    ~LeaveContractEnvironment() {
+      if (had_value) setenv(name, previous.c_str(), 1);
+      else unsetenv(name);
+    }
+  } environment;
+  ASSERT_EQ(setenv(environment.name, GetParam() ? "1" : "0", 1), 0);
   char directory_pattern[] = "/tmp/mocktail-composition-launch-test-XXXXXX";
   char* launch_directory = mkdtemp(directory_pattern);
   ASSERT_NE(launch_directory, nullptr);
@@ -816,9 +833,13 @@ TEST(RobloxExperienceCompositionTest,
   ASSERT_TRUE(composition.DrainLaunchRequests().ok());
   EXPECT_EQ(probe.leaves, 1);
   EXPECT_EQ(probe.starts.load(), 1);
-
-  // nativeAppBridgeV2LeaveGame ends in the Native stage and Roblox sends no
-  // Lua app return, so the queued launch starts once the leave has returned.
+  if (!GetParam()) {
+    ASSERT_TRUE(composition.DrainLaunchRequests().ok());
+    EXPECT_EQ(probe.leaves, 1);
+    EXPECT_EQ(probe.starts.load(), 1);
+    // Clients whose leave is asynchronous still require gameDidLeave.
+    composition.NotifyLuaAppDidReturn();
+  }
   for (int attempt = 0; attempt < 1000 && probe.starts.load() < 2; ++attempt) {
     ASSERT_TRUE(composition.DrainLaunchRequests().ok());
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -837,6 +858,9 @@ TEST(RobloxExperienceCompositionTest,
   std::filesystem::remove_all(launch_directory, ignored);
   g_probe = nullptr;
 }
+
+INSTANTIATE_TEST_SUITE_P(LeaveContracts, RobloxExperienceControlledSwitchTest,
+                        testing::Values(false, true));
 
 TEST(RobloxExperienceCompositionTest,
      DrainStartsOwnedLaunchWorkerWithoutBlockingOwnerThread) {

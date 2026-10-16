@@ -377,7 +377,8 @@ bool MergeAudioDeviceMenuClientSettingsOverrides(std::string_view base_json,
 
 bool MergeVrClientSettingsOverrides(bool enabled, std::string_view base_json,
                                     std::string* merged_json,
-                                    std::string* error) {
+                                    std::string* error,
+                                    bool preserve_temporal_depth) {
   if (merged_json == nullptr) {
     if (error != nullptr) {
       *error = "VR client-settings output is required";
@@ -411,6 +412,10 @@ bool MergeVrClientSettingsOverrides(bool enabled, std::string_view base_json,
     // is enabled; VR controllers connect as Gamepad1.
     overrides["FFlagKeepHapticsOnMobileWhenGamepadConnected"] = "True";
     overrides["FFlagVRHaptics"] = "True";
+    if (preserve_temporal_depth) {
+      // Memoryless allocations cannot preserve depth for temporal upscaling.
+      overrides["FFlagVulkanLazilyAllocatedTextureSupport"] = "False";
+    }
   }
   *merged_json = overrides.dump();
   return true;

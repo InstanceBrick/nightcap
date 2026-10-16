@@ -18,6 +18,9 @@ extern "C" void mocktail_vr_xr_queue_submit_adapter(SubmitAdapter);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 mocktail_vulkan_idle_synchronized(PFN_vkDeviceWaitIdle raw, VkDevice device);
 
+extern "C" VKAPI_ATTR std::int32_t mocktail_vulkan_run_queue_synchronized(
+    VkDevice device, VkQueue queue, std::int32_t (*operation)(void *), void *context);
+
 namespace {
 std::mutex state_mutex;
 std::condition_variable state_changed;
@@ -228,6 +231,59 @@ TEST(VrQueueSubmission, FenceWaitDoesNotKeepItsOwnQueueHostLocked) {
   }
   presenter.join();
   mocktail_vr_xr_queue_submit_adapter(nullptr);
+  EXPECT_EQ(result, VK_SUCCESS);
+}
+
+TEST(VrQueueSubmission, RuntimeFrameCallExcludesGuestOnTheSameQueue) {
+  mocktail::vr::internal::RequestVulkanQueueSharing();
+  inside_driver = max_inside = 0;
+  const auto device = reinterpret_cast<VkDevice>(2);
+  const auto queue = reinterpret_cast<VkQueue>(30);
+  std::thread runtime([&] {
+    EXPECT_EQ(mocktail_vulkan_run_queue_synchronized(
+        device, queue, [](void *context) -> std::int32_t {
+          EXPECT_EQ(context, reinterpret_cast<void *>(42));
+          SlowSubmit(VK_NULL_HANDLE, 0, nullptr, VK_NULL_HANDLE);
+          return -37;
+        }, reinterpret_cast<void *>(42)), -37);
+  });
+  std::thread guest([&] {
+    EXPECT_EQ(mocktail_vulkan_submit_synchronized(
+        SlowSubmit, device, queue, 0, nullptr, VK_NULL_HANDLE), VK_SUCCESS);
+  });
+  runtime.join();
+  guest.join();
+  EXPECT_EQ(max_inside, 1);
+  // An error from the runtime must also release the queue lock.
+  EXPECT_EQ(mocktail_vulkan_submit_synchronized(
+      Submit, device, queue, 0, nullptr, VK_NULL_HANDLE), VK_SUCCESS);
+}
+TEST(VrQueueSubmission, RuntimeFrameCallDoesNotBlockADifferentQueue) {
+  mocktail::vr::internal::RequestVulkanQueueSharing();
+  waiting = signal_submitted = false;
+  const auto device = reinterpret_cast<VkDevice>(2);
+  std::int32_t result = VK_NOT_READY;
+  std::thread runtime([&] {
+    result = mocktail_vulkan_run_queue_synchronized(
+        device, reinterpret_cast<VkQueue>(30), [](void *) -> std::int32_t {
+          return Wait(VK_NULL_HANDLE, 0, nullptr, VK_TRUE, UINT64_MAX);
+        }, nullptr);
+  });
+  bool entered;
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    entered = state_changed.wait_for(lock, std::chrono::seconds(1),
+                                     [] { return waiting; });
+  }
+  const auto semaphore = reinterpret_cast<VkSemaphore>(32);
+  VkSubmitInfo signal{};
+  signal.signalSemaphoreCount = 1;
+  signal.pSignalSemaphores = &semaphore;
+  EXPECT_EQ(mocktail_vulkan_submit_synchronized(
+      Submit, device, reinterpret_cast<VkQueue>(31), 1, &signal, VK_NULL_HANDLE),
+      VK_SUCCESS);
+  runtime.join();
+  EXPECT_TRUE(entered);
   EXPECT_EQ(result, VK_SUCCESS);
 }
 } // namespace

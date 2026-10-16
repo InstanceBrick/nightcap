@@ -309,6 +309,7 @@ struct EngineStartupContext {
   jnivm::RobloxAuthIdentity account_identity;
   const mocktail::runtime::SecureRobloxCredential* roblox_credential;
   mocktail::runtime::RobloxGameSessionRuntime* game_session_runtime;
+  mocktail::runtime::LuauCodegenMenuSwitch* luau_codegen_switch;
   bool run_prepare_jni;
   bool run_set_asset_path;
   bool call_real_set_asset_path;
@@ -3977,6 +3978,13 @@ void* EngineStartupThread(void* arg) {
     }
   }
 
+  // All client-setting initialization is complete. Verify the native switch
+  // before any LuaApp startup can compile menu scripts. Failure leaves the
+  // client's own codegen policy unchanged.
+  if (context->luau_codegen_switch != nullptr) {
+    context->luau_codegen_switch->PrepareForMenus();
+  }
+
   if (context->run_set_init_params) {
     env = ensure_env();
     if (!context->run_native_settings && context->native_set_device_info &&
@@ -4705,7 +4713,7 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
             mocktail::runtime::kLuauCodegenAllFastFlagName);
         if (flag == nullptr) {
           std::cerr << "  [luau-codegen] DebugLuauCodegenAll not found; "
-                       "leaving it on in games\n";
+                       "automatic menu codegen disabled\n";
         } else {
           std::cout << "  [luau-codegen] menus-only switch at +0x" << std::hex
                     << (reinterpret_cast<std::uintptr_t>(flag) - base)
@@ -6962,6 +6970,7 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
         dependencies.account_identity(),
         &dependencies.roblox_credential(),
         game_session_runtime.get(),
+        &luau_codegen_switch,
         run_prepare_jni,
         run_set_asset_path,
         call_real_set_asset_path,

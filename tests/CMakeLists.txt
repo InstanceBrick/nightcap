@@ -48,7 +48,14 @@ target_link_libraries(vr_evidence_layer_test PRIVATE Vulkan::Headers
   ${CMAKE_DL_LIBS} GTest::gtest_main)
 mocktail_apply_compile_options(vr_evidence_layer_test)
 
-add_executable(roblox_vr_device_bridge_test vr/roblox_vr_device_bridge_test.cc)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  add_executable(roblox_vr_device_bridge_test vr/roblox_vr_device_bridge_arm64_test.cc)
+  add_executable(arm64_guest_abi_test vr/arm64_guest_abi_test.cc)
+  target_include_directories(arm64_guest_abi_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  add_test(NAME ArmVrGuestAbi COMMAND arm64_guest_abi_test)
+else()
+  add_executable(roblox_vr_device_bridge_test vr/roblox_vr_device_bridge_test.cc)
+endif()
 target_include_directories(roblox_vr_device_bridge_test PRIVATE
   "${PROJECT_SOURCE_DIR}/src")
 target_compile_definitions(roblox_vr_device_bridge_test PRIVATE
@@ -60,6 +67,9 @@ target_link_libraries(roblox_vr_device_bridge_test PRIVATE
 )
 mocktail_apply_compile_options(roblox_vr_device_bridge_test)
 if(MOCKTAIL_ENABLE_VR)
+  add_executable(vulkan_xr_recreation_probe vr/vulkan_xr_recreation_probe.cc)
+  target_include_directories(vulkan_xr_recreation_probe PRIVATE "${PROJECT_SOURCE_DIR}/third_party/OpenXR-SDK/include")
+  target_link_libraries(vulkan_xr_recreation_probe PRIVATE Mocktail::VR ${CMAKE_DL_LIBS})
   add_executable(openxr_backend_test vr/openxr_backend_test.cc)
   target_include_directories(openxr_backend_test PRIVATE "${PROJECT_SOURCE_DIR}/third_party/OpenXR-SDK/include")
   target_link_libraries(openxr_backend_test PRIVATE Mocktail::VR GTest::gtest_main)
@@ -744,6 +754,24 @@ target_link_libraries(chrome_trace_writer_test PRIVATE GTest::gtest_main
   Threads::Threads nlohmann_json::nlohmann_json)
 mocktail_apply_compile_options(chrome_trace_writer_test)
 
+add_executable(vulkan_foveation_device_policy_test
+  graphics/vulkan_foveation_device_policy_test.cc)
+target_include_directories(vulkan_foveation_device_policy_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(vulkan_foveation_device_policy_test PRIVATE
+  Vulkan::Headers GTest::gtest_main)
+mocktail_apply_compile_options(vulkan_foveation_device_policy_test)
+gtest_discover_tests(vulkan_foveation_device_policy_test)
+
+add_executable(vulkan_barrier_adjustment_test
+  graphics/vulkan_barrier_adjustment_test.cc)
+target_include_directories(vulkan_barrier_adjustment_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(vulkan_barrier_adjustment_test PRIVATE
+  Vulkan::Headers GTest::gtest_main)
+mocktail_apply_compile_options(vulkan_barrier_adjustment_test)
+gtest_discover_tests(vulkan_barrier_adjustment_test)
+
 add_executable(vulkan_etc2_emulation_test
   vulkan_etc2_emulation_test.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
@@ -1413,3 +1441,94 @@ if(MOCKTAIL_ENABLE_VR)
   target_include_directories(xr_actions_test PRIVATE "${CMAKE_SOURCE_DIR}/third_party/OpenXR-SDK/include")
   gtest_discover_tests(xr_actions_test)
 endif()
+
+add_executable(gaze_aa_gpu_test vr/gaze_aa_gpu_test.cc)
+find_library(NIGHTCAP_AA_VULKAN_LOADER NAMES vulkan libvulkan.so.1 REQUIRED)
+target_link_libraries(gaze_aa_gpu_test PRIVATE Mocktail::VR ${NIGHTCAP_AA_VULKAN_LOADER})
+
+# Offscreen full-detail gaze / actual peripheral shading regression.
+add_executable(scene_foveation_gpu_test vr/scene_foveation_gpu_test.cc)
+target_include_directories(scene_foveation_gpu_test PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/src/vr")
+target_link_libraries(scene_foveation_gpu_test PRIVATE ${NIGHTCAP_AA_VULKAN_LOADER})
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(performance_stats_test vr/performance_stats_test.cc)
+  target_include_directories(performance_stats_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(performance_stats_test PRIVATE GTest::gtest_main)
+  gtest_discover_tests(performance_stats_test)
+endif()
+
+add_executable(eye_resize_boundary_test vr/eye_resize_boundary_test.cc)
+target_include_directories(eye_resize_boundary_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(eye_resize_boundary_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(eye_resize_boundary_test)
+
+add_executable(fsr_upscaler_gpu_test vr/fsr_upscaler_gpu_test.cc)
+target_link_libraries(fsr_upscaler_gpu_test PRIVATE Mocktail::VR ${NIGHTCAP_AA_VULKAN_LOADER})
+
+add_executable(fsr_settings_test vr/fsr_settings_test.cc)
+target_include_directories(fsr_settings_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(fsr_settings_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(fsr_settings_test)
+
+add_executable(async_settings_test vr/async_settings_test.cc)
+target_include_directories(async_settings_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(async_settings_test PRIVATE GTest::gtest_main Threads::Threads)
+gtest_discover_tests(async_settings_test)
+add_test(NAME SteamFrameRefreshPolicy COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/steam_frame_refresh_policy_test.py")
+
+foreach(_fsr3_test fsr3_scene_inputs fsr3_device_features fsr3_runtime_device)
+  add_executable(${_fsr3_test}_test vr/${_fsr3_test}_test.cc)
+  target_include_directories(${_fsr3_test}_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(${_fsr3_test}_test PRIVATE GTest::gtest_main Vulkan::Headers)
+  gtest_discover_tests(${_fsr3_test}_test)
+endforeach()
+add_executable(fsr3_scene_capture_test vr/fsr3_scene_capture_test.cc
+  "${PROJECT_SOURCE_DIR}/src/vr/fsr3_scene_capture.cc")
+target_include_directories(fsr3_scene_capture_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(fsr3_scene_capture_test PRIVATE GTest::gtest_main Vulkan::Headers)
+gtest_discover_tests(fsr3_scene_capture_test)
+
+add_executable(pacing_policy_test vr/pacing_policy_test.cc)
+target_include_directories(pacing_policy_test PRIVATE "${PROJECT_SOURCE_DIR}/tools/frame_video_settings")
+target_link_libraries(pacing_policy_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(pacing_policy_test)
+gtest_discover_tests(pacing_policy_test)
+
+add_executable(framebuffer_density_map_test vr/framebuffer_density_map_test.cc)
+target_include_directories(framebuffer_density_map_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(framebuffer_density_map_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(framebuffer_density_map_test)
+gtest_discover_tests(framebuffer_density_map_test)
+
+add_executable(foveation_tile_bounds_test vr/foveation_tile_bounds_test.cc)
+target_include_directories(foveation_tile_bounds_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(foveation_tile_bounds_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(foveation_tile_bounds_test)
+gtest_discover_tests(foveation_tile_bounds_test)
+
+add_executable(fsr3_transition_adapter_test vr/fsr3_transition_adapter_test.cc)
+target_include_directories(fsr3_transition_adapter_test PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(fsr3_transition_adapter_test PRIVATE GTest::gtest_main Vulkan::Headers)
+target_compile_definitions(fsr3_transition_adapter_test PRIVATE MOCKTAIL_ENABLE_FSR3=1)
+mocktail_apply_compile_options(fsr3_transition_adapter_test)
+gtest_discover_tests(fsr3_transition_adapter_test)
+
+add_executable(anti_aliasing_settings_test vr/anti_aliasing_settings_test.cc)
+target_include_directories(anti_aliasing_settings_test PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(anti_aliasing_settings_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(anti_aliasing_settings_test)
+gtest_discover_tests(anti_aliasing_settings_test)
+add_test(NAME SteamFrameMsaaPolicy COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/steam_frame_msaa_policy_test.py")
+
+add_executable(resolution_default_policy_test vr/resolution_default_policy_test.cc)
+target_include_directories(resolution_default_policy_test PRIVATE "${PROJECT_SOURCE_DIR}/tools/frame_video_settings")
+target_link_libraries(resolution_default_policy_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(resolution_default_policy_test)
+gtest_discover_tests(resolution_default_policy_test)
+
+add_executable(fsr3_disabled_adapter_test vr/fsr3_disabled_adapter_test.cc)
+target_include_directories(fsr3_disabled_adapter_test PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(fsr3_disabled_adapter_test PRIVATE GTest::gtest_main Vulkan::Headers)
+mocktail_apply_compile_options(fsr3_disabled_adapter_test)
+gtest_discover_tests(fsr3_disabled_adapter_test)

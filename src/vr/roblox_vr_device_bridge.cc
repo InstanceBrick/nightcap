@@ -1,4 +1,7 @@
 #include "mocktail/vr/roblox_vr_device_bridge.h"
+#include "mocktail/vr/eye_resize_boundary.h"
+#include "mocktail/vr/projection_jitter.h"
+#include "mocktail/vr/native_projection.h"
 
 #include <elf.h>
 #include <sys/mman.h>
@@ -26,11 +29,18 @@
 #include <thread>
 
 #include "vr/roblox_vr_device_bridge_internal.h"
+#include "vr/roblox_projection_arm64_contract.h"
+#include "vr/roblox_motion_arm64_contract.h"
+#if defined(__aarch64__)
+#include "vr/roblox_vr_arm64_build_contracts.h"
+#endif
 
 namespace mocktail::vr {
 namespace {
 
 using internal::kConstructorContractSize;
+using internal::kPointerGetterContractSize;
+using internal::kHapticContractSize;
 using internal::kExpectedObjectType;
 using internal::kEyeGetterContractSize;
 using internal::kEyeGetterVtableSlot;
@@ -47,7 +57,7 @@ using internal::kStateGetterVtableSlot;
 using internal::kTextureSlotOffset;
 using internal::kWidthOffset;
 
-std::uintptr_t RelativeTarget(const std::uint8_t* displacement,
+[[maybe_unused]] std::uintptr_t RelativeTarget(const std::uint8_t* displacement,
                               std::uintptr_t next_instruction_rva) {
   std::int32_t relative;
   std::memcpy(&relative, displacement, sizeof(relative));
@@ -69,7 +79,7 @@ struct HookCall {
 // Roblox's original getters, kept for the process lifetime (libroblox is
 // never unloaded) so a hook still reachable after shutdown, or whose vtable
 // could not be restored, always forwards instead of returning garbage.
-std::atomic<void *(*)(void *, void *)> g_original_state_getter{nullptr};
+std::atomic<guest_abi::StateGetterFn> g_original_state_getter{nullptr};
 std::atomic<void *(*)(void *, int)> g_original_eye_getter{nullptr};
 // Evidence queries expose only the current native call's provenance. These
 // pointers are identities for the layer, never retained/dereferenced by it.
@@ -78,33 +88,79 @@ thread_local void *g_eye_object = nullptr;
 thread_local void *g_eye_framebuffer = nullptr;
 thread_local int g_eye_index = -1;
 thread_local bool g_thread_presented = false;
+thread_local internal::EyeResizeBoundary g_eye_resize_boundary;
 std::mutex g_native_pose_mutex;
 ScriptedPoseSample g_native_pose;
-using PointerFrameFn = void *(*)(void *, void *);
+thread_local ScriptedPoseSample g_projection_pose;
+std::mutex g_projection_mutex;
+NativeProjectionSample g_projection_samples[2];
+std::atomic<bool> g_projection_hook_ready{false};
+#if defined(__aarch64__)
+struct NativeProjectionResult { float matrix[16] = {}; };
+static_assert(sizeof(NativeProjectionResult) == 64);
+using NativeProjectionFn = NativeProjectionResult (*)(void* camera, int eye);
+std::atomic<NativeProjectionFn> g_projection_original{nullptr};
+std::atomic<NativeProjectionFn> g_view_projection_original{nullptr};
+std::uintptr_t g_projection_target = 0;
+std::uintptr_t g_view_projection_target = 0;
+#endif
+using PointerFrameFn = guest_abi::PointerFrameFn;
 std::atomic<PointerFrameFn> g_pointer_original{nullptr};
+#if defined(__aarch64__)
+// Four whole, PC-independent instructions; x8 (sret) stays untouched.
+constexpr std::array<unsigned char, 16> kPointerPrologue = {
+    0xff, 0x83, 0x02, 0xd1, 0xfd, 0x7b, 0x07, 0xa9,
+    0xf6, 0x57, 0x08, 0xa9, 0xf4, 0x4f, 0x09, 0xa9};
+#else
 // Whole instructions, no RIP-relative operands; shared sret prologue.
 constexpr std::array<unsigned char, 15> kPointerPrologue = {
     0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
     0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x70};
+#endif
 std::uintptr_t g_pointer_target = 0;
 
 void AbsoluteJump(unsigned char *code, std::uintptr_t target) {
+#if defined(__aarch64__)
+  // ldr x16, PC+8; br x16; .quad target. x16 is an ABI scratch register.
+  const std::uint32_t opcode[2] = {0x58000050, 0xd61f0200};
+  std::memcpy(code, opcode, sizeof(opcode));
+  std::memcpy(code + 8, &target, 8);
+#else
   const unsigned char opcode[6] = {0xff, 0x25, 0, 0, 0, 0};
   std::memcpy(code, opcode, 6);
   std::memcpy(code + 6, &target, 8);
+#endif
 }
 
-extern "C" void *mocktail_vr_pointer_frame(void *result, void *service) {
+void FlushCode(unsigned char* code, std::size_t size) {
+  __builtin___clear_cache(reinterpret_cast<char*>(code),
+                          reinterpret_cast<char*>(code + size));
+}
+
+void DispatchPointerFrame(void *result, void *service) {
   HookCall in_flight;
   auto original = g_pointer_original.load(std::memory_order_acquire);
   if (!original)
-    return result;
-  original(result, service);
+    return;
+  guest_abi::CallPointer(original, result, service);
   auto *bridge = g_active_bridge.load(std::memory_order_seq_cst);
-  if (!bridge || !bridge->active()) return result;
+  if (!bridge || !bridge->active()) return;
   bridge->OnPointerFrameCall(result, service);
+  return;
+}
+
+#if defined(__aarch64__)
+extern "C" guest_abi::FrameResult mocktail_vr_pointer_frame(void* service) {
+  guest_abi::FrameResult result{};
+  DispatchPointerFrame(&result, service);
   return result;
 }
+#else
+extern "C" void* mocktail_vr_pointer_frame(void* result, void* service) {
+  DispatchPointerFrame(result, service);
+  return result;
+}
+#endif
 
 bool SetCodeWritable(std::uintptr_t target, bool writable) {
   const auto page_size = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
@@ -116,6 +172,101 @@ bool SetCodeWritable(std::uintptr_t target, bool writable) {
   return mprotect(reinterpret_cast<void *>(first), end - first,
                   PROT_READ | PROT_EXEC | (writable ? PROT_WRITE : 0)) == 0;
 }
+
+#if defined(__aarch64__)
+void ProcessNativeProjection(NativeProjectionResult& result, void* camera,
+                             int eye, bool view_projection) {
+  const auto* bridge = g_active_bridge.load(std::memory_order_seq_cst);
+  // The original getter already read this camera's VR-enabled byte. This
+  // offset is pinned by the complete function contract, not inferred from a
+  // camera class layout. Only the presenting thread publishes a scene sample.
+  if (!g_projection_hook_ready.load(std::memory_order_acquire) || !bridge ||
+      !bridge->active() || !camera || eye < 0 || eye > 1 ||
+      !g_thread_presented || !g_projection_pose.valid ||
+      !g_projection_pose.frame ||
+      !(static_cast<const std::uint8_t*>(camera)[820] & 1))
+    return;
+  NativeProjectionSample sample;
+  if (view_projection) {
+    // Both accesses and the per-eye mirror are pinned by the complete
+    // projection-getter contract. The combined getter inlines these loads.
+    std::memcpy(sample.projection,
+                static_cast<const std::uint8_t*>(camera) + 560, 64);
+    if (eye)
+      sample.projection[2] = -sample.projection[2];
+    for (float value : result.matrix)
+      if (!std::isfinite(value))
+        return;
+    std::copy_n(result.matrix, 16, sample.view_projection);
+    sample.view_projection_valid = true;
+  } else {
+    std::copy_n(result.matrix, 16, sample.projection);
+  }
+  if (!DecodeReverseProjectionDepth(sample.projection, &sample.camera_near,
+                                     &sample.camera_far,
+                                     &sample.depth_infinite))
+    return;
+  sample.frame = g_projection_pose.frame;
+  sample.camera_identity = reinterpret_cast<std::uintptr_t>(camera);
+  sample.render_width = g_projection_pose.projection_render_width;
+  sample.render_height = g_projection_pose.projection_render_height;
+  sample.depth_inverted = true;
+  sample.jitter_applied = view_projection
+      ? ApplyRasterViewProjectionJitter(
+            result.matrix, g_projection_pose.projection_jitter_valid,
+            g_projection_pose.projection_jitter_pixels, sample.render_width,
+            sample.render_height)
+      : ApplyRasterMatrixProjectionJitter(
+            result.matrix, g_projection_pose.projection_jitter_valid,
+            g_projection_pose.projection_jitter_pixels, sample.render_width,
+            sample.render_height);
+  if (sample.jitter_applied)
+    std::copy_n(g_projection_pose.projection_jitter_pixels, 2,
+                 sample.jitter_pixels);
+  sample.valid = true;
+  static std::atomic<bool> observed[2][2];
+  if (!observed[eye][view_projection].exchange(true))
+    std::fprintf(stderr,
+                 "  [vr-device] native temporal camera eye=%d frame=%llu "
+                 "world_vp=%d near=%.6f far=%.2f reverse_z=1 jitter=%d\n",
+                 eye, static_cast<unsigned long long>(sample.frame),
+                 view_projection, sample.camera_near, sample.camera_far,
+                 sample.jitter_applied);
+  {
+    std::lock_guard<std::mutex> lock(g_projection_mutex);
+    const auto& previous = g_projection_samples[eye];
+    if (!sample.view_projection_valid && previous.view_projection_valid &&
+        previous.frame == sample.frame &&
+        previous.camera_identity == sample.camera_identity) {
+      std::copy_n(previous.view_projection, 16, sample.view_projection);
+      sample.view_projection_valid = true;
+    }
+    g_projection_samples[eye] = sample;
+  }
+}
+
+extern "C" NativeProjectionResult mocktail_vr_native_eye_projection(void* camera,
+                                                                  int eye) {
+  HookCall in_flight;
+  NativeProjectionResult result;
+  if (const auto original = g_projection_original.load(std::memory_order_acquire)) {
+    result = original(camera, eye);
+    ProcessNativeProjection(result, camera, eye, false);
+  }
+  return result;
+}
+
+extern "C" NativeProjectionResult mocktail_vr_native_eye_view_projection(
+    void* camera, int eye) {
+  HookCall in_flight;
+  NativeProjectionResult result;
+  if (const auto original = g_view_projection_original.load(std::memory_order_acquire)) {
+    result = original(camera, eye);
+    ProcessNativeProjection(result, camera, eye, true);
+  }
+  return result;
+}
+#endif
 
 bool InstallPointerHook(std::uintptr_t base, std::uintptr_t pointer_rva) {
   // The jump stays installed for the process lifetime (see
@@ -135,6 +286,7 @@ bool InstallPointerHook(std::uintptr_t base, std::uintptr_t pointer_rva) {
   std::memcpy(code, target, kPointerPrologue.size());
   AbsoluteJump(code + kPointerPrologue.size(),
                base + pointer_rva + kPointerPrologue.size());
+  FlushCode(code, kPointerPrologue.size() + 16);
   if (mprotect(code, page_size, PROT_READ | PROT_EXEC) != 0 ||
       !SetCodeWritable(base + pointer_rva, true)) {
     munmap(code, page_size);
@@ -144,9 +296,13 @@ bool InstallPointerHook(std::uintptr_t base, std::uintptr_t pointer_rva) {
                            std::memory_order_release);
   AbsoluteJump(target,
                reinterpret_cast<std::uintptr_t>(&mocktail_vr_pointer_frame));
+#if !defined(__aarch64__)
   target[14] = 0x90;
+#endif
+  FlushCode(target, kPointerPrologue.size());
   if (!SetCodeWritable(base + pointer_rva, false)) {
     std::memcpy(target, kPointerPrologue.data(), kPointerPrologue.size());
+    FlushCode(target, kPointerPrologue.size());
     (void)SetCodeWritable(base + pointer_rva, false);
     return false;
   }
@@ -180,7 +336,14 @@ bool IsValidElfImage(std::uintptr_t image_base) {
   }
   const auto *header = reinterpret_cast<const Elf64_Ehdr *>(image_base);
   return std::memcmp(header->e_ident, ELFMAG, SELFMAG) == 0 &&
-         header->e_ident[EI_CLASS] == ELFCLASS64 && header->e_phoff != 0 &&
+         header->e_ident[EI_CLASS] == ELFCLASS64 &&
+         header->e_ident[EI_DATA] == ELFDATA2LSB &&
+#if defined(__aarch64__)
+         header->e_machine == EM_AARCH64 &&
+#else
+         header->e_machine == EM_X86_64 &&
+#endif
+         header->e_phoff != 0 &&
          header->e_phnum != 0;
 }
 
@@ -273,7 +436,7 @@ bool SetVtableRangeWritable(std::uintptr_t *first_slot,
                   protection) == 0;
 }
 
-bool ContainsBytes(const std::uint8_t *code, std::size_t size,
+[[maybe_unused]] bool ContainsBytes(const std::uint8_t *code, std::size_t size,
                    const std::uint8_t *expected, std::size_t expected_size) {
   if (code == nullptr || expected == nullptr || expected_size == 0 ||
       expected_size > size) {
@@ -299,6 +462,192 @@ void Log(const char *format, ...) {
   std::fflush(stderr);
 }
 
+[[maybe_unused]] bool InstallNativeProjectionHook(std::uintptr_t base,
+                                 const internal::VrBuildContract& contract) {
+#if defined(__aarch64__)
+  if (g_projection_hook_ready.load(std::memory_order_acquire))
+    return g_projection_target == base + internal::kNativeProjectionGetter3222Rva &&
+           g_view_projection_target == base + internal::kNativeViewProjectionGetter3222Rva;
+  constexpr auto rva = internal::kNativeProjectionGetter3222Rva;
+  constexpr auto size = internal::kNativeProjectionGetter3222.size();
+  constexpr auto view_rva = internal::kNativeViewProjectionGetter3222Rva;
+  constexpr auto view_size = internal::kNativeViewProjectionGetter3222.size();
+  if (!IsExecutableImageRange(base, rva, size) ||
+      !IsExecutableImageRange(base, view_rva, view_size) ||
+      !internal::HasExpectedNativeProjectionContract(
+          reinterpret_cast<const std::uint8_t*>(base + rva), size,
+          contract.build_id) ||
+      !internal::HasExpectedNativeViewProjectionContract(
+          reinterpret_cast<const std::uint8_t*>(base + view_rva), view_size,
+          contract.build_id))
+    return false;
+  const auto page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  if (!page_size)
+    return false;
+  auto* code = static_cast<unsigned char*>(mmap(
+      nullptr, page_size, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (code == MAP_FAILED)
+    return false;
+  std::memcpy(code, reinterpret_cast<const void*>(base + rva), size);
+  FlushCode(code, size);
+  if (mprotect(code, page_size, PROT_READ | PROT_EXEC) != 0 ||
+      !SetCodeWritable(base + rva, true)) {
+    munmap(code, page_size);
+    return false;
+  }
+  g_projection_original.store(reinterpret_cast<NativeProjectionFn>(code),
+                               std::memory_order_release);
+  auto* target = reinterpret_cast<unsigned char*>(base + rva);
+  AbsoluteJump(target, reinterpret_cast<std::uintptr_t>(
+                           &mocktail_vr_native_eye_projection));
+  FlushCode(target, 16);
+  if (!SetCodeWritable(base + rva, false)) {
+    std::memcpy(target, internal::kNativeProjectionGetter3222.data(), 16);
+    FlushCode(target, 16);
+    (void)SetCodeWritable(base + rva, false);
+    // Retain the trampoline: an entering guest call may already use it.
+    return false;
+  }
+  g_projection_target = base + rva;
+  // The combined getter's first four instructions are a PC-independent stack
+  // prologue. Its calls and relative branches remain at their original site.
+  auto* view_code = static_cast<unsigned char*>(mmap(
+      nullptr, page_size, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (view_code == MAP_FAILED)
+    return false;
+  std::memcpy(view_code, reinterpret_cast<const void*>(base + view_rva), 16);
+  AbsoluteJump(view_code + 16, base + view_rva + 16);
+  FlushCode(view_code, 32);
+  if (mprotect(view_code, page_size, PROT_READ | PROT_EXEC) != 0 ||
+      !SetCodeWritable(base + view_rva, true)) {
+    munmap(view_code, page_size);
+    return false;
+  }
+  g_view_projection_original.store(reinterpret_cast<NativeProjectionFn>(view_code),
+                                    std::memory_order_release);
+  auto* view_target = reinterpret_cast<unsigned char*>(base + view_rva);
+  AbsoluteJump(view_target, reinterpret_cast<std::uintptr_t>(
+                                &mocktail_vr_native_eye_view_projection));
+  FlushCode(view_target, 16);
+  if (!SetCodeWritable(base + view_rva, false)) {
+    std::memcpy(view_target, internal::kNativeViewProjectionGetter3222.data(), 16);
+    FlushCode(view_target, 16);
+    (void)SetCodeWritable(base + view_rva, false);
+    return false;
+  }
+  g_view_projection_target = base + view_rva;
+  g_projection_hook_ready.store(true, std::memory_order_release);
+  Log("  [vr-device] native per-eye temporal projection hook ready (3222)\n");
+  return true;
+#else
+  (void)base;
+  (void)contract;
+  return false;
+#endif
+}
+
+bool EnableNativeClipMotionConstructor(std::uintptr_t image_base,
+    const internal::VrBuildContract& contract) {
+#if defined(__aarch64__)
+  using namespace internal;
+  const auto constructor=image_base+kNativeMotionConstructorRva3222;
+  const auto instruction=constructor+kNativeMotionModeInstructionOffset;
+  const auto setup=image_base+kNativeMotionSetupRva3222;
+  const auto setup_instruction=setup+kNativeMotionSetupInstructionOffset;
+  static std::atomic<std::uintptr_t> patched{0};
+  if(const auto previous=patched.load(std::memory_order_acquire))
+    return previous==instruction;
+  if(!IsExecutableImageRange(image_base,kNativeMotionConstructorRva3222,
+       kNativeMotionConstructor3222.size()) ||
+      !IsExecutableImageRange(image_base,kNativeMotionSetupRva3222,
+       kNativeMotionSetup3222.size()) ||
+      !HasExpectedNativeMotionConstructorContract(
+       reinterpret_cast<const std::uint8_t*>(constructor),
+       kNativeMotionConstructor3222.size(),contract.build_id) ||
+      !HasExpectedNativeMotionSetupContract(
+       reinterpret_cast<const std::uint8_t*>(setup),
+       kNativeMotionSetup3222.size(),contract.build_id))return false;
+  // Activate runs before the first constructor. This is one aligned ARM64
+  // instruction at each verified site; no generic setter is changed.
+  const auto patch=[](std::uintptr_t address,std::uint32_t original,
+                       std::uint32_t replacement) {
+    if(!SetCodeWritable(address,true))return false;
+    auto* target=reinterpret_cast<std::uint32_t*>(address);
+    __atomic_store_n(target,replacement,__ATOMIC_RELEASE);
+    FlushCode(reinterpret_cast<unsigned char*>(target),sizeof(*target));
+    if(SetCodeWritable(address,false))return true;
+    __atomic_store_n(target,original,__ATOMIC_RELEASE);
+    FlushCode(reinterpret_cast<unsigned char*>(target),sizeof(*target));
+    (void)SetCodeWritable(address,false);return false;
+  };
+  if(!patch(instruction,kNativeMotionWorldModeInstruction,
+             kNativeMotionClipModeInstruction))return false;
+  // If this second site cannot be changed, its original setter mode1 still
+  // overrides the constructor and the adapter rejects world-space vectors.
+  if(!patch(setup_instruction,kNativeMotionWorldSetupInstruction,
+             kNativeMotionClipSetupInstruction))return false;
+  // Like the getter entry hooks, retain the startup choice for this process.
+  // Restoring it while another native constructor executes would be unsafe.
+  patched.store(instruction,std::memory_order_release);
+  return true;
+#else
+  (void)image_base;(void)contract;return false;
+#endif
+}
+
+[[maybe_unused]] void EnableNativeMotionBuffers(std::uintptr_t image_base,
+                                const internal::VrBuildContract& contract) {
+  const char* requested = std::getenv("MOCKTAIL_VR_FSR3_NATIVE_MOTION");
+  if (!requested || std::strcmp(requested, "1") != 0)
+    return;
+#if defined(__aarch64__)
+  // 3222's initializer stores this property as int32, and getter0x322fef0
+  // caches (value > random_percent) once. Activate runs before guest startup;
+  // fail closed if the guard says the first read already happened. The cache
+  // itself and its guard are never modified.
+  constexpr std::uintptr_t kValueRva = 0x6ac05e8;
+  constexpr std::uintptr_t kNameRva = 0x4da4d3;
+  constexpr std::uintptr_t kCacheGuardRva = 0x6ac0c20;
+  if (contract.build_id != "25aa7fd31008a744c3c99f717e7d16d81d371d12" ||
+      !IsWritableDataImageRange(image_base, kCacheGuardRva, 8) ||
+      __atomic_load_n(reinterpret_cast<const std::uint8_t*>(
+                          image_base + kCacheGuardRva), __ATOMIC_ACQUIRE) != 0 ||
+      !internal::SetNamedFastInt32(image_base, kValueRva, "MotionBuffers3",
+                                   kNameRva, 100)) {
+    Log("  [vr-device] native motion opt-in rejected: exact property "
+        "or pre-initialization contract unavailable\n");
+    return;
+  }
+  Log("  [vr-device] native motion buffers enabled before first read "
+      "(MotionBuffers3=100)\n");
+  // Diagnostic-only generic clip-motion path. Normal ASW capability remains
+  // unchanged; this additional opt-in must also be requested before startup.
+  const char* debug = std::getenv("MOCKTAIL_VR_FSR3_NATIVE_MOTION_DEBUG");
+  if (debug && std::strcmp(debug, "1") == 0) {
+    constexpr std::uintptr_t kDebugValueRva = 0x6c0ede8;
+    if (internal::EnableNamedFastFlag(image_base, kDebugValueRva,
+                                      "MotionBuffersDebug")) {
+      if(EnableNativeClipMotionConstructor(image_base,contract)) {
+        Log("  [vr-device] diagnostic native clip-motion rendering enabled "
+            "(MotionBuffersDebug=true, native clip mode=0)\n");
+      } else {
+        Log("  [vr-device] diagnostic native motion enabled; clip-mode "
+            "initialization contract unavailable (world-space vectors rejected)\n");
+      }
+    } else {
+      Log("  [vr-device] diagnostic native motion opt-in rejected: "
+          "exact boolean property unavailable\n");
+    }
+  }
+#else
+  (void)image_base;
+  (void)contract;
+  Log("  [vr-device] native motion opt-in unavailable for this architecture\n");
+#endif
+}
+
 std::uintptr_t* g_is_vr_app_build_slot = nullptr;
 std::uintptr_t g_is_vr_app_build_original = 0;
 
@@ -311,10 +660,39 @@ extern "C" __attribute__((aligned(16))) bool mocktail_vr_is_vr_app_build(
   return bridge != nullptr && bridge->active();
 }
 
-void InstallIsVrAppBuildHook(std::uintptr_t image_base) {
+void InstallIsVrAppBuildHook(std::uintptr_t image_base, const internal::VrBuildContract& contract) {
   if (g_is_vr_app_build_slot != nullptr || !IsValidElfImage(image_base)) {
     return;
   }
+#if defined(__aarch64__)
+  const auto* arm = internal::arm64::ForBuildId(contract.build_id);
+  if (!arm) return;
+  constexpr char name[] = "IsVRAppBuild";
+  if (!IsExecutableImageRange(image_base, arm->kIsVrAppRegistrationRva,
+                              arm->kIsVrAppRegistration.size()) ||
+      !internal::arm64::Matches(reinterpret_cast<const std::uint8_t*>(
+                        image_base + arm->kIsVrAppRegistrationRva),
+                    arm->kIsVrAppRegistration.size(), arm->kIsVrAppRegistration) ||
+      !IsExecutableImageRange(image_base, arm->kIsVrAppGetterRva,
+                              arm->kIsVrAppGetter.size()) ||
+      !internal::arm64::Matches(reinterpret_cast<const std::uint8_t*>(
+                        image_base + arm->kIsVrAppGetterRva),
+                    arm->kIsVrAppGetter.size(), arm->kIsVrAppGetter) ||
+      !IsWritableDataImageRange(image_base, arm->kIsVrAppDescriptorRva, arm->descriptor_slot + 16) ||
+      !IsProgramHeaderRange(image_base, arm->kIsVrAppNameRva, sizeof(name),
+                             PT_LOAD, PF_R) ||
+      std::memcmp(reinterpret_cast<const void*>(image_base + arm->kIsVrAppNameRva),
+                   name, sizeof(name)) != 0) {
+    return;
+  }
+  auto* slot = reinterpret_cast<std::uintptr_t*>(
+      image_base + arm->kIsVrAppDescriptorRva + arm->descriptor_slot);
+  if (*slot != image_base + arm->kIsVrAppGetterRva || slot[1] != 0) return;
+  g_is_vr_app_build_original = *slot;
+  g_is_vr_app_build_slot = slot;
+  __atomic_store_n(slot, FunctionAddress(&mocktail_vr_is_vr_app_build), __ATOMIC_RELEASE);
+  Log("  [vr-device] interposed ARM64 VRService::IsVRAppBuild descriptor\n");
+#else
   const std::uintptr_t image_size = ImageSize(image_base);
   const auto* header = reinterpret_cast<const Elf64_Ehdr*>(image_base);
   const auto* program_headers = reinterpret_cast<const Elf64_Phdr*>(
@@ -381,6 +759,7 @@ void InstallIsVrAppBuildHook(std::uintptr_t image_base) {
       }
     }
   }
+#endif
 }
 
 void RestoreIsVrAppBuildHook() {
@@ -478,7 +857,7 @@ bool IsExecutableRva(std::uintptr_t image_base, std::uintptr_t rva) {
   return IsExecutableImageRange(image_base, rva, 1);
 }
 
-void InstallSetMotorHook(std::uintptr_t image_base) {
+[[maybe_unused]] void InstallSetMotorHook(std::uintptr_t image_base) {
   if (g_set_motor_slot != nullptr || !IsValidElfImage(image_base)) return;
   const auto* image = reinterpret_cast<const std::uint8_t*>(image_base);
   const std::size_t image_size = ImageSize(image_base);
@@ -549,6 +928,16 @@ void RestoreSetMotorHook() {
 namespace internal {
 
 constexpr VrBuildContract kContracts[] = {
+#if defined(__aarch64__)
+    {"25aa7fd31008a744c3c99f717e7d16d81d371d12",
+     {0x67b6688, 0x4e5558c, 0x4e55964, 0x4e55958, 0x4e55974, 0x6c0d1b0, 0x188},
+     0x64da5e0, 0x4a28e28, 0x25473c4, 0x3a0, 0x6c0afa0, 0x1e5a9e8,
+     0x108, 0x130, 0, 0, 0, 0, "3222 (2.742.1059 ARM64)"},
+    {"ed2b035768b1513561d0e6ea7f9bbec35b0e60e5",
+     {0x635ab08, 0x3451d10, 0x34520e8, 0x34520dc, 0x34520f8, 0x6a4b498, 0x178},
+     0x6251e70, 0x4744924, 0x25146dc, 0x3a8, 0x6a49a70, 0x1d70070,
+     0x118, 0x140, 0, 0, 0, 0, "2998 (2.736.1408 ARM64)"},
+#else
     {"ade08266c67aee88ec9c1d00902150e1684dad3a",
      {0x6c87b38, 0x3810614, 0x38109f6, 0x38109e6, 0x3810a18, 0x7369920,
       0x180},
@@ -597,6 +986,7 @@ constexpr VrBuildContract kContracts[] = {
      0x74cf458,
      0x74cfa10,
      "3222 (2.742.1059)"},
+#endif
 };
 
 const VrBuildContract* FindVrBuildContract(std::string_view build_id) {
@@ -606,8 +996,48 @@ const VrBuildContract* FindVrBuildContract(std::string_view build_id) {
   return nullptr;
 }
 
+bool HasExpectedNativeProjectionContract(const std::uint8_t* code,
+                                         std::size_t size,
+                                         std::string_view build_id) {
+  return build_id == "25aa7fd31008a744c3c99f717e7d16d81d371d12" && code &&
+         size >= kNativeProjectionGetter3222.size() &&
+         std::memcmp(code, kNativeProjectionGetter3222.data(),
+                     kNativeProjectionGetter3222.size()) == 0;
+}
+
+bool HasExpectedNativeViewProjectionContract(const std::uint8_t* code,
+                                             std::size_t size,
+                                             std::string_view build_id) {
+  return build_id == "25aa7fd31008a744c3c99f717e7d16d81d371d12" && code &&
+         size >= kNativeViewProjectionGetter3222.size() &&
+         std::memcmp(code, kNativeViewProjectionGetter3222.data(),
+                     kNativeViewProjectionGetter3222.size()) == 0;
+}
+
+bool HasExpectedNativeMotionConstructorContract(const std::uint8_t* code,
+                                                std::size_t size,
+                                                std::string_view build_id) {
+  return build_id=="25aa7fd31008a744c3c99f717e7d16d81d371d12" && code &&
+      size>=kNativeMotionConstructor3222.size() &&
+      std::memcmp(code,kNativeMotionConstructor3222.data(),
+                  kNativeMotionConstructor3222.size())==0;
+}
+
+bool HasExpectedNativeMotionSetupContract(const std::uint8_t* code,
+                                          std::size_t size,
+                                          std::string_view build_id) {
+  return build_id=="25aa7fd31008a744c3c99f717e7d16d81d371d12" && code &&
+      size>=kNativeMotionSetup3222.size() &&
+      std::memcmp(code,kNativeMotionSetup3222.data(),
+                  kNativeMotionSetup3222.size())==0;
+}
+
 bool HasExpectedVrPointerContract(const std::uint8_t* code, std::size_t size,
                                   const VrBuildContract& contract) {
+#if defined(__aarch64__)
+  const auto* arm = arm64::ForBuildId(contract.build_id);
+  return arm && contract.pointer_frame_rva == arm->kPointerGetterRva && contract.workspace_getter_rva == arm->kWorkspaceGetterRva && contract.camera_vtable_offset == arm->camera_slot && contract.pointer_hand_selector_offset == arm->hand_selector && contract.camera_head_scale_offset == arm->head_scale && arm64::Matches(code,size,arm->kPointerGetter);
+#else
   if (code == nullptr || size < 0x1b2 ||
       std::memcmp(code, kPointerPrologue.data(), kPointerPrologue.size()) !=
           0 ||
@@ -634,6 +1064,7 @@ bool HasExpectedVrPointerContract(const std::uint8_t* code, std::size_t size,
          camera_slot == contract.camera_vtable_offset &&
          selector == contract.pointer_hand_selector_offset &&
          head_scale == contract.camera_head_scale_offset;
+#endif
 }
 
 EyeResourceState InspectEyeResources(const void *object) {
@@ -663,6 +1094,10 @@ EyeResourceState InspectEyeResources(const void *object) {
 bool HasExpectedVrStateGetterContract(const std::uint8_t* code,
                                       std::size_t size,
                                       const VrBuildContract& contract) {
+#if defined(__aarch64__)
+  const auto* arm = arm64::ForBuildId(contract.build_id);
+  return arm && contract.device.state_getter_rva == arm->kStateGetterRva && contract.state_memcpy_rva == arm->state_memcpy && arm64::Matches(code,size,arm->kStateGetter);
+#else
   // push rbp; mov rbp,rsp; push rbx; push rax; mov rbx,rdi; add rsi,0x14;
   // mov edx,0x138; call memcpy; mov rax,rbx; add rsp,8; pop rbx; pop rbp; ret
   static constexpr std::array<std::uint8_t, kStateGetterContractSize>
@@ -675,21 +1110,30 @@ bool HasExpectedVrStateGetterContract(const std::uint8_t* code,
          std::memcmp(code + 23, kExpected.data() + 23, 10) == 0 &&
          RelativeTarget(code + 19, contract.device.state_getter_rva + 23) ==
              contract.state_memcpy_rva;
+#endif
 }
 
 bool HasExpectedVrEyeGetterContract(const std::uint8_t *code,
                                     std::size_t size) {
+#if defined(__aarch64__)
+  return arm64::Matches(code, size, arm64::kEyeGetter);
+#else
   // movsxd rax,esi; shl rax,4; mov rax,[rdi+rax+0x150]; ret
   static constexpr std::array<std::uint8_t, kEyeGetterContractSize> kExpected =
       {0x48, 0x63, 0xc6, 0x48, 0xc1, 0xe0, 0x04, 0x48,
        0x8b, 0x84, 0x07, 0x50, 0x01, 0x00, 0x00, 0xc3};
   return code != nullptr && size >= kExpected.size() &&
          std::memcmp(code, kExpected.data(), kExpected.size()) == 0;
+#endif
 }
 
 bool HasExpectedVrConstructorContract(
     const std::uint8_t* code, std::size_t size,
     const compat::VrDebugDeviceBridgeProfile& profile) {
+#if defined(__aarch64__)
+  const auto* arm = arm64::ForConstructor(profile.constructor_rva);
+  return arm && profile.vtable_rva == arm->vtable && arm64::Matches(code,size,arm->kConstructor);
+#else
   static constexpr std::array<std::uint8_t, 29> kPrologue = {
       0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
       0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28, 0x49, 0x89, 0xcf,
@@ -725,11 +1169,16 @@ bool HasExpectedVrConstructorContract(
          ContainsBytes(code, size, kWidthHeightStore.data(),
                        kWidthHeightStore.size()) &&
          ContainsBytes(code, size, kDeviceStore.data(), kDeviceStore.size());
+#endif
 }
 
 bool HasExpectedVrEyeInitializerContract(
     const std::uint8_t *code, std::size_t size,
     const compat::VrDebugDeviceBridgeProfile &profile) {
+#if defined(__aarch64__)
+  const auto* arm = arm64::ForInitializer(profile.eye_initializer_rva);
+  return arm && profile.device_create_framebuffer_vtable_offset == arm->framebuffer_slot && arm64::Matches(code,size,arm->kInitializer);
+#else
   static constexpr std::array<std::uint8_t, 24> kPrologue = {
       0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
       0x53, 0x48, 0x81, 0xec, 0xa8, 0x00, 0x00, 0x00, 0x48, 0x89, 0xb5, 0x50};
@@ -768,6 +1217,7 @@ bool HasExpectedVrEyeInitializerContract(
                        kFramebufferSlotBase.size()) &&
          ContainsBytes(code, size, device_call.data(), 10) &&
          ContainsBytes(code, size, kEyeLoopTail.data(), kEyeLoopTail.size());
+#endif
 }
 
 bool HasExpectedVrDebugDeviceVtable(
@@ -786,19 +1236,14 @@ bool HasExpectedVrDebugDeviceVtable(
 
 namespace {
 
-// Guest-callable interposed vtable entries. The guest Android ABI for these
-// methods is SysV amd64: the state getter is sret (rdi = hidden 0x138-byte
-// result buffer, rsi = device object, returns the buffer) and the eye getter
-// takes (rdi = device object, esi = eye index) and returns the framebuffer
-// object pointer.
+// Guest-callable entries use the native Android ABI for this architecture.
 extern "C" void mocktail_vr_debug_device_haptics(void* object, int hand, float amplitude) {
   HookCall in_flight;
   if (auto* bridge = g_active_bridge.load(std::memory_order_seq_cst))
     bridge->OnHapticsCall(object, hand, amplitude);
 }
 
-extern "C" void *mocktail_vr_debug_device_state_getter(void *result_buffer,
-                                                       void *device_object) {
+void DispatchStateGetter(void *result_buffer, void *device_object) {
   HookCall in_flight;
   RobloxVrDeviceBridge *bridge =
       g_active_bridge.load(std::memory_order_seq_cst);
@@ -807,10 +1252,22 @@ extern "C" void *mocktail_vr_debug_device_state_getter(void *result_buffer,
   } else if (const auto original =
                  g_original_state_getter.load(std::memory_order_acquire)) {
     // Bridge gone but the slot still points here: Roblox's own answer.
-    original(result_buffer, device_object);
+    guest_abi::CallState(original, result_buffer, device_object);
   }
-  return result_buffer;
 }
+
+#if defined(__aarch64__)
+extern "C" guest_abi::StateResult mocktail_vr_debug_device_state_getter(void* device_object) {
+  guest_abi::StateResult result{};
+  DispatchStateGetter(&result, device_object);
+  return result;
+}
+#else
+extern "C" void* mocktail_vr_debug_device_state_getter(void* result, void* device_object) {
+  DispatchStateGetter(result, device_object);
+  return result;
+}
+#endif
 
 extern "C" void *mocktail_vr_debug_device_eye_getter(void *device_object,
                                                      int eye_index) {
@@ -818,6 +1275,9 @@ extern "C" void *mocktail_vr_debug_device_eye_getter(void *device_object,
   RobloxVrDeviceBridge *bridge =
       g_active_bridge.load(std::memory_order_seq_cst);
   const auto original = g_original_eye_getter.load(std::memory_order_acquire);
+  // Mark before invoking the guest: it may query state while selecting the
+  // eye target, and that target must remain alive until this frame ends.
+  g_eye_resize_boundary.OnEyeGetter();
   void *framebuffer =
       original != nullptr ? original(device_object, eye_index) : nullptr;
   if (bridge != nullptr) {
@@ -860,6 +1320,25 @@ const compat::VrDebugDeviceBridgeProfile* FindRobloxVrDeviceProfile(
     std::string_view build_id) {
   const auto* contract = internal::FindVrBuildContract(build_id);
   return contract == nullptr ? nullptr : &contract->device;
+}
+
+bool NativeProjectionBridgeReady() {
+  return g_projection_hook_ready.load(std::memory_order_acquire);
+}
+
+bool ReadNativeProjectionSample(int eye, std::uint64_t expected_frame,
+                                NativeProjectionSample* sample) {
+  HookCall in_flight;
+  const auto* bridge = g_active_bridge.load(std::memory_order_seq_cst);
+  if (!sample || eye < 0 || eye > 1 || !expected_frame ||
+      !NativeProjectionBridgeReady() || !bridge || !bridge->active())
+    return false;
+  std::lock_guard<std::mutex> lock(g_projection_mutex);
+  if (!g_projection_samples[eye].valid ||
+      g_projection_samples[eye].frame != expected_frame)
+    return false;
+  *sample = g_projection_samples[eye];
+  return true;
 }
 
 std::string DescribeSupportedVrBuilds() {
@@ -916,6 +1395,28 @@ bool EnableNamedFastFlag(std::uintptr_t image_base, std::uintptr_t rva,
     return false;
   }
   *reinterpret_cast<std::uint8_t*>(image_base + rva) = 1;
+  return true;
+}
+
+bool SetNamedFastInt32(std::uintptr_t image_base, std::uintptr_t rva,
+                       std::string_view name, std::uintptr_t name_rva,
+                       std::int32_t value) {
+  constexpr std::size_t kNamePointerOffset = 8;
+  if (!rva || !name_rva || !IsWritableDataImageRange(
+          image_base, rva, kNamePointerOffset + sizeof(std::uintptr_t)) ||
+      !IsProgramHeaderRange(image_base, name_rva, name.size() + 1,
+                             PT_LOAD, PF_R))
+    return false;
+  std::uintptr_t name_address = 0;
+  std::memcpy(&name_address,
+              reinterpret_cast<const void*>(image_base + rva + kNamePointerOffset),
+              sizeof(name_address));
+  if (name_address != image_base + name_rva)
+    return false;
+  const auto* stored = reinterpret_cast<const char*>(name_address);
+  if (std::memcmp(stored, name.data(), name.size()) != 0 || stored[name.size()])
+    return false;
+  std::memcpy(reinterpret_cast<void*>(image_base + rva), &value, sizeof(value));
   return true;
 }
 
@@ -1294,10 +1795,10 @@ Status RobloxVrDeviceBridge::Activate(std::uintptr_t image_base) {
        profile_.eye_getter_rva + kEyeGetterContractSize,
        profile_.eye_initializer_rva + kInitializerContractSize,
        profile_.emulator_flag_storage_rva + 1, contract_->state_memcpy_rva + 1,
-       contract_->pointer_frame_rva + 0x1b2,
+       contract_->pointer_frame_rva + kPointerGetterContractSize,
        contract_->workspace_getter_rva + 1,
        contract_->hand_pitch_storage_rva + sizeof(int),
-       contract_->haptic_sink_rva + 1,
+       contract_->haptic_sink_rva + kHapticContractSize,
        contract_->keep_haptics_flag_rva + 1,
        contract_->vr_haptics_flag_rva + 1,
        contract_->support_generic_haptics_flag_rva + 1,
@@ -1364,17 +1865,36 @@ Status RobloxVrDeviceBridge::Activate(std::uintptr_t image_base) {
   }
 
   if (!IsExecutableImageRange(image_base, contract_->pointer_frame_rva,
-                              0x1b2) ||
+                              kPointerGetterContractSize) ||
       !internal::HasExpectedVrPointerContract(
           reinterpret_cast<const std::uint8_t*>(image_base +
                                                 contract_->pointer_frame_rva),
-          0x1b2, *contract_)) {
+          kPointerGetterContractSize, *contract_)) {
     return FailedPrecondition("VR pointer function contract mismatch");
   }
+#if defined(__aarch64__)
+  const auto* arm = internal::arm64::ForBuildId(contract_->build_id);
+  if (!arm) return FailedPrecondition("unsupported ARM64 VR build");
+  for (const auto& range : {std::pair{arm->kWorkspaceGetterRva, arm->kWorkspaceGetter.size()},
+                            std::pair{arm->kFramebufferHelperRva, arm->kFramebufferHelper.size()}}) {
+    if (!IsExecutableImageRange(image_base, range.first, range.second))
+      return FailedPrecondition("ARM64 VR helper is outside executable image");
+  }
+  if (!internal::arm64::Matches(reinterpret_cast<const std::uint8_t*>(image_base + arm->kWorkspaceGetterRva),
+                    arm->kWorkspaceGetter.size(), arm->kWorkspaceGetter) ||
+      !internal::arm64::Matches(reinterpret_cast<const std::uint8_t*>(image_base + arm->kFramebufferHelperRva),
+                    arm->kFramebufferHelper.size(), arm->kFramebufferHelper))
+    return FailedPrecondition("ARM64 VR helper instruction contract mismatch");
+  if (vtable[3] != image_base + contract_->haptic_sink_rva ||
+      !IsExecutableImageRange(image_base, contract_->haptic_sink_rva, kHapticContractSize) ||
+      !internal::arm64::Matches(reinterpret_cast<const std::uint8_t*>(image_base + contract_->haptic_sink_rva),
+                    kHapticContractSize, arm->kHapticSink)) {
+#else
   if (vtable[3] != image_base + contract_->haptic_sink_rva ||
       !IsExecutableImageRange(image_base, contract_->haptic_sink_rva, 1) ||
       *reinterpret_cast<const unsigned char*>(
           image_base + contract_->haptic_sink_rva) != 0xc3) {
+#endif
     return FailedPrecondition("VR haptic vtable contract mismatch");
   }
   image_base_.store(image_base, std::memory_order_relaxed);
@@ -1428,9 +1948,19 @@ Status RobloxVrDeviceBridge::Activate(std::uintptr_t image_base) {
     (void)RestoreVtableLocked();
     return FailedPrecondition("could not install verified VR aim pointer hook");
   }
-  InstallIsVrAppBuildHook(image_base);
+  // Temporal upscaling is unavailable unless this additional exact-build
+  // contract matches; ordinary stereo VR remains usable on older clients.
+#ifdef MOCKTAIL_ENABLE_FSR3
+  (void)InstallNativeProjectionHook(image_base, *contract_);
+  EnableNativeMotionBuffers(image_base, *contract_);
+#endif
+  InstallIsVrAppBuildHook(image_base, *contract_);
   ResetHandHaptics();
+#if !defined(__aarch64__)
+  // The descriptor/tuple reader below decodes x86 instructions. ARM64 uses
+  // the architecture-independent JNI HapticProtocol bridge instead.
   InstallSetMotorHook(image_base);
+#endif
   if (internal::EnableNamedFastFlag(image_base,
                                     contract_->keep_haptics_flag_rva,
                                     "KeepHapticsOnMobileWhenGamepadConnected")) {
@@ -1457,6 +1987,11 @@ Status RobloxVrDeviceBridge::Activate(std::uintptr_t image_base) {
   {
     std::lock_guard<std::mutex> pose_lock(g_native_pose_mutex);
     g_native_pose = {};
+  }
+  {
+    std::lock_guard<std::mutex> projection_lock(g_projection_mutex);
+    g_projection_samples[0] = {};
+    g_projection_samples[1] = {};
   }
   active_.store(true, std::memory_order_release);
   Log("  [vr-device] activated: DebugDeviceVR haptics/input/eyes +0x18/+0x28/+0x48 and aim pointer "
@@ -1547,6 +2082,7 @@ void RobloxVrDeviceBridge::NoteHostPresent() {
         thread_id);
   }
   g_thread_presented = true;
+  g_eye_resize_boundary.OnPresent();
   // SetMotor is a held level with no engine-side refresh; renew its lease.
   for (int hand = 0; hand < 2; ++hand) {
     if (g_set_motor_level[hand].load(std::memory_order_relaxed) > 0)
@@ -1827,9 +2363,20 @@ void RobloxVrDeviceBridge::OnStateGetterCall(void *result_buffer,
           internal::EyeResourceState::kEmpty) {
     TryInitializeEyes(device_object);
   }
+  if (active_.load(std::memory_order_acquire) && g_eye_resize_boundary.CanResize() &&
+      ValidateObjectHeader(device_object) &&
+      internal::InspectEyeResources(device_object) == internal::EyeResourceState::kReady) {
+    if (auto* backend=ActiveVrBackend(); backend && backend->UpdateEyeResolution()) {
+      // Replace owning shared_ptr eye slots before either target is borrowed
+      // in this frame. Device idle alone cannot protect commands that the
+      // guest is still recording with a previous eye target.
+      TryInitializeEyes(device_object);
+    }
+  }
   const auto original = original_state_getter();
   if (original != nullptr)
-    original(result_buffer, device_object);
+    guest_abi::CallState(original, result_buffer, device_object);
+  g_projection_pose = {};
   if (active_.load(std::memory_order_acquire) && result_buffer && original) {
     if (auto* backend = ActiveVrBackend()) {
       const auto pose = backend->PublishedHeadPose();
@@ -1838,6 +2385,7 @@ void RobloxVrDeviceBridge::OnStateGetterCall(void *result_buffer,
         g_native_pose = pose;
       }
       if (internal::ApplyXrPose(result_buffer, pose)) {
+        g_projection_pose = pose;
         backend->NotePoseApplied(device_object, pose.frame);
         static thread_local std::uint64_t last_logged = 0;
         if (pose.frame != last_logged && (pose.frame == 1 || pose.frame % 20 == 0)) {

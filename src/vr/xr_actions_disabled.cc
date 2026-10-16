@@ -10,7 +10,7 @@ struct XrActions::Impl {};
 
 XrActions::~XrActions() = default;
 
-Status XrActions::Create(void *) {
+Status XrActions::Create(void *, bool) {
   return Status::Error(StatusCode::kUnavailable,
                        "OpenXR support is disabled in this build");
 }

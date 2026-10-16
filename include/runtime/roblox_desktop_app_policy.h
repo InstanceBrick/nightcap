@@ -36,7 +36,8 @@ DesktopAppPolicyResult ApplyDesktopAppPolicy(
 bool MergeDesktopAppPolicyClientSettingsOverride(std::string_view policy_json,
                                                  std::string_view base_json,
                                                  std::string* merged_json,
-                                                 std::string* error);
+                                                 std::string* error,
+                                                 bool default_codegen_at_startup = true);
 
 // Apply after desktop policy composition. Roblox 2998's Android payload is not
 // a VRAppBuild, so its LuaApp enables RunService's idle render throttle

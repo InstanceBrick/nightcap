@@ -3,6 +3,8 @@
 
 include_guard(GLOBAL)
 
+option(MOCKTAIL_ENABLE_FSR3 "Build the optional temporal upscaler SDK" OFF)
+
 # AUTO builds OpenXR support when the third_party/OpenXR-SDK submodule is
 # checked out and skips it otherwise, so source packages that do not fetch
 # submodules still build. ON requires the submodule; OFF never builds it.
@@ -26,6 +28,9 @@ else()
 endif()
 
 add_library(mocktail_vr STATIC
+  src/vr/gaze_aa.cc
+  src/vr/fsr_upscaler.cc
+  src/vr/fsr3_scene_capture.cc
   src/vr/diagnostics.cc
   src/vr/headset_detection.cc
   src/vr/openxr_backend_mode.cc
@@ -69,8 +74,14 @@ if(MOCKTAIL_ENABLE_VR)
       "${CMAKE_BINARY_DIR}/third_party/OpenXR-SDK" EXCLUDE_FROM_ALL)
   endfunction()
   mocktail_add_openxr_sdk()
+  if(MOCKTAIL_ENABLE_FSR3)
+    add_subdirectory(third_party/fidelityfx)
+    target_sources(mocktail_vr PRIVATE src/vr/fsr3_upscaler.cc src/vr/fsr3_gaze_transport.cc)
+    target_link_libraries(mocktail_vr PRIVATE nightcap_fsr3)
+    target_compile_definitions(mocktail_vr PUBLIC MOCKTAIL_ENABLE_FSR3=1)
+  endif()
   target_sources(mocktail_vr PRIVATE src/vr/openxr_probe.cc src/vr/openxr_preview.cc
-    src/vr/openxr_backend.cc src/vr/gles_transport.cc src/vr/xr_actions.cc
+    src/vr/openxr_backend.cc src/vr/xr_foveation_maps.cc src/vr/gles_transport.cc src/vr/xr_actions.cc
     src/vr/virtual_keyboard_raster.cc)
   # The in-headset keyboard draws its labels with the same SDL3_ttf and
   # fontconfig stack as the TextBox overlay.
@@ -83,7 +94,7 @@ if(MOCKTAIL_ENABLE_VR)
   # Error unwinding is confined to these native session implementations; their
   # public entry points catch errors before returning to the guest runtime.
   set_source_files_properties(src/vr/openxr_preview.cc src/vr/openxr_backend.cc
-    src/vr/xr_actions.cc
+    src/vr/xr_actions.cc src/vr/xr_foveation_maps.cc
     PROPERTIES COMPILE_OPTIONS -fexceptions)
   target_compile_definitions(mocktail_vr PRIVATE XR_USE_GRAPHICS_API_VULKAN)
   option(MOCKTAIL_VR_DIAGNOSTICS
@@ -93,16 +104,10 @@ if(MOCKTAIL_ENABLE_VR)
   endif()
   set_source_files_properties(src/vr/openxr_backend.cc PROPERTIES COMPILE_DEFINITIONS "XR_USE_GRAPHICS_API_OPENGL_ES;XR_USE_PLATFORM_EGL")
   target_include_directories(mocktail_vr PRIVATE ${MOCKTAIL_EGL_INCLUDE_DIR} ${MOCKTAIL_GLES3_INCLUDE_DIR})
-  # SMAA's area and search lookup textures for vr.anti_aliasing: smaa.
-  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/smaa/Textures/AreaTex.h")
-    message(FATAL_ERROR
-      "Initialize SMAA: git submodule update --init third_party/smaa")
-  endif()
-  target_include_directories(mocktail_vr PRIVATE "${CMAKE_SOURCE_DIR}/third_party/smaa")
   target_link_libraries(mocktail_vr PRIVATE OpenXR::openxr_loader Vulkan::Headers ${CMAKE_DL_LIBS})
 else()
   target_sources(mocktail_vr PRIVATE src/vr/openxr_disabled.cc
-    src/vr/xr_actions_disabled.cc)
+    src/vr/xr_actions_disabled.cc src/vr/xr_foveation_maps_disabled.cc)
 endif()
 
 if(MOCKTAIL_ENABLE_VR)

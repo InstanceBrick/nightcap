@@ -1,6 +1,6 @@
 # Modified by vii from komaruworld/mocktail. See README "About this fork".
 name: Bug report
-description: Report a reproducible problem in Nightcap
+description: Report a reproducible problem on Steam Frame
 title: "[Bug]: "
 labels:
   - bug
@@ -13,7 +13,6 @@ body:
 
         Use any language you are comfortable with.
 
-        Please write issues and pull requests yourself.
 
   - type: input
     id: version
@@ -28,8 +27,8 @@ body:
     id: system
     attributes:
       label: System information
-      description: Include your distribution, desktop session, GPU, and graphics driver when relevant.
-      placeholder: "For example: Arch Linux, KDE Plasma 6 on Wayland, AMD RX 6600, Mesa 26.1"
+      description: Include the SteamOS, SteamVR and graphics driver versions.
+      placeholder: "Steam Frame, SteamOS version, SteamVR build, Turnip version"
     validations:
       required: true
 
@@ -38,7 +37,7 @@ body:
     attributes:
       label: Installation method
       description: Tell us how Nightcap was installed or built.
-      placeholder: "For example: AppImage, Flatpak, AUR, or built from source"
+      placeholder: "Source build using the Steam Frame container recipe"
     validations:
       required: true
 
@@ -76,10 +75,8 @@ body:
       value: |
         Latest log:
 
-        - Flatpak: `~/.var/app/io.github.CoderDayton.nightcap/.local/state/mocktail/logs/latest.log`
-        - Other installs: `~/.local/state/mocktail/logs/latest.log`
+        `~/.local/share/nightcap-vr-arm64/last-launch.log`
 
-        Older logs are in the `sessions` directory next to `latest.log`.
 
   - type: textarea
     id: logs

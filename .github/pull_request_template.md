@@ -1,4 +1,7 @@
-<!-- Modified by vii from komaruworld/mocktail. See README "About this fork". -->
-<!-- Briefly describe what this pull request adds, changes, or removes. Link the issue with "Closes #123" or "Fixes #123". -->
+## Change
 
-Closes #
+Describe the behavior changed on Steam Frame and link any relevant issue.
+
+## Checks
+
+Describe the build, tests or device checks run for this change.

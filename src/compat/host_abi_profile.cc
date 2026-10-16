@@ -6,6 +6,25 @@ namespace mocktail::compat {
 namespace {
 
 constexpr HostAbiProfile kProfiles[] = {
+    // Roblox 2.742.1059 ARM64. Constructor roles were re-derived: allocator
+    // wiring 4, JNI singleton 5, lazy clock 6, native process load 7.
+    // Preserve the payload's new native replay order and initialize TLS after 7.
+    {"25aa7fd31008a744c3c99f717e7d16d81d371d12",
+     {{{0x1e40368, HostBridgeKind::kAllocate, "small-allocate"},
+       {0x1e436b0, HostBridgeKind::kUsableSize, "usable-size"},
+       {0x1e5977c, HostBridgeKind::kReallocate, "reallocate"},
+       {0x1e4007c, HostBridgeKind::kAllocate, "allocate"},
+       {0x648d13c, HostBridgeKind::kAlignedAllocate, "aligned-allocate-direct"},
+       {0x1e43de4, HostBridgeKind::kFree, "free"}}},
+     6,
+     {0, 0, 0x71a32a8, 0x400, 0x1e406f0, 0x1eaa240,
+      0x71b21b0, 0x71b2240, 0x400000},
+     {0x1e4007c, 0x1e43de4},
+     0x69dcab0, 3673,
+     {{{5, 6}, {7, 3673}}}, 2,
+     {{{4, 3673}}}, 1, 7,
+     {0x21aeb44, 0x70e60f0},
+     HostAllocatorStrategy::kNativeMimalloc},
     // Roblox 2.738.1397; promoted from the exact-build probation profile.
     {"5f0704edd9064f566ee3d6df2bd2fabbcc709f03",
      {{{0x1d73422, HostBridgeKind::kAllocate, "small-allocate"},

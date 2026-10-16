@@ -33,7 +33,11 @@ constexpr std::size_t kOutputCountVtableIndex = 5;
 constexpr std::size_t kOutputInfoVtableIndex = 6;
 constexpr std::size_t kGuestStringSize = 24;
 constexpr std::size_t kGuestDeviceInfoSize = kGuestStringSize * 2 + 1;
+#if defined(__aarch64__)
+constexpr std::size_t kStringConstructorContractSize = 32;
+#else
 constexpr std::size_t kStringConstructorContractSize = 24;
+#endif
 constexpr std::size_t kMaximumMenuDevices = 128;
 constexpr std::size_t kMaximumDeviceNameBytes = 512;
 
@@ -138,9 +142,16 @@ bool HasExpectedFmodStringConstructorContract(const std::uint8_t* code,
                                               std::size_t size) {
   constexpr std::array<std::uint8_t, kStringConstructorContractSize>
       kExpectedPrefix = {
+#if defined(__aarch64__)
+          0xfd,0x7b,0xbd,0xa9,0xf6,0x57,0x01,0xa9,
+          0xf4,0x4f,0x02,0xa9,0xfd,0x03,0x00,0x91,
+          0xf4,0x03,0x02,0xaa,0xf3,0x03,0x01,0xaa,
+          0x5f,0x58,0x00,0xf1,0xf5,0x03,0x00,0xaa,
+#else
           0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
           0x41, 0x54, 0x53, 0x48, 0x89, 0xd3, 0x49, 0x89,
           0xf6, 0x49, 0x89, 0xff, 0x48, 0x83, 0xfa, 0x16,
+#endif
       };
   return code != nullptr && size >= kExpectedPrefix.size() &&
          std::memcmp(code, kExpectedPrefix.data(), kExpectedPrefix.size()) == 0;
@@ -454,6 +465,22 @@ Status RobloxOutputDeviceBridge::PatchVtableLocked() {
   }
 
   if (profile_.has_input_devices()) {
+#if defined(__aarch64__)
+    // The capture ABI was checked against this exact ARM64 payload. Do not
+    // infer capture signatures from neighboring virtual slots on later builds.
+    constexpr std::array<std::uintptr_t,6> capture_2998={
+        0x2f964f4,0x2f96068,0x2f96c74,0x2f97464,0x2f95c64,0x2f97a64};
+    constexpr std::array<std::uintptr_t,6> capture_3222={
+        0x2c356c8,0x2c34c60,0x2c36538,0x2c36b1c,0x2c349ec,0x2c36db8};
+    const bool build2998 = profile_.vtable_rva==0x632aeb0 && profile_.vtable_layout_version==1;
+    const bool build3222 = profile_.vtable_rva==0x6569770 && profile_.vtable_layout_version==2;
+    if(!build2998 && !build3222)
+      return FailedPrecondition("unsupported ARM64 native capture profile");
+    const auto& capture_rvas = build3222 ? capture_3222 : capture_2998;
+    for(std::size_t i=0;i<capture_indexes.size();++i)
+      if(vtable_[capture_indexes[i]]!=library_base_+capture_rvas[i])
+        return FailedPrecondition("ARM64 native capture vtable contract mismatch");
+#endif
     for (std::size_t i = 0; i < capture_indexes.size(); ++i) {
       const auto method = vtable_[capture_indexes[i]];
       if (method < library_base_ ||
@@ -591,18 +618,17 @@ int RobloxOutputDeviceBridge::GetOutputDeviceCount(void* self) {
   return bridge != nullptr ? bridge->DeviceCount() : 0;
 }
 
-void* RobloxOutputDeviceBridge::GetOutputDeviceInfo(void* result, void* self,
-                                                    int index) {
+RobloxOutputDeviceBridge::DeviceInfoResult
+RobloxOutputDeviceBridge::GetOutputDeviceInfo(void* self, int index) {
+  DeviceInfoResult result{};
   static_cast<void>(self);
   RobloxOutputDeviceBridge* bridge =
       g_active_bridge.load(std::memory_order_acquire);
   if (bridge == nullptr) {
-    if (result != nullptr) {
-      std::memset(result, 0, kGuestDeviceInfoSize);
-    }
     return result;
   }
-  return bridge->DeviceInfo(result, index);
+  bridge->DeviceInfo(result.bytes, index);
+  return result;
 }
 
 int RobloxOutputDeviceBridge::GetCurrentOutputDevice(void* self) {
@@ -626,13 +652,12 @@ int RobloxOutputDeviceBridge::GetInputDeviceCount(void *) {
   return bridge ? bridge->DeviceCount(true) : 0;
 }
 
-void *RobloxOutputDeviceBridge::GetInputDeviceInfo(void *result, void *,
-                                                   int index) {
+RobloxOutputDeviceBridge::DeviceInfoResult
+RobloxOutputDeviceBridge::GetInputDeviceInfo(void*, int index) {
+  DeviceInfoResult result{};
   auto *bridge = g_active_bridge.load(std::memory_order_acquire);
   if (bridge)
-    return bridge->DeviceInfo(result, index, true);
-  if (result)
-    std::memset(result, 0, kGuestDeviceInfoSize);
+    bridge->DeviceInfo(result.bytes, index, true);
   return result;
 }
 

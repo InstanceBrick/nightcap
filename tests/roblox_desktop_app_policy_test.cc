@@ -252,6 +252,28 @@ TEST(RobloxDesktopAppPolicyTest, DefaultsLuauCodegenAllUnlessOverridden) {
   EXPECT_EQ(nlohmann::json::parse(merged)["FFlagDebugLuauCodegenAll"], false);
 }
 
+TEST(RobloxDesktopAppPolicyTest, DefersAutomaticLuauCodegenUntilNativeValidation) {
+  std::string merged;
+  std::string error;
+  ASSERT_TRUE(MergeDesktopAppPolicyClientSettingsOverride(
+      R"({"PlatformGroup":"Desktop"})", "{}", &merged, &error, false)) << error;
+  const auto settings = nlohmann::json::parse(merged);
+  EXPECT_FALSE(settings.contains("FFlagDebugLuauCodegenAll"));
+  EXPECT_TRUE(settings.contains("FStringAppConfigurationOverrideAppPolicy"));
+}
+
+TEST(RobloxDesktopAppPolicyTest, DeferredLuauCodegenPreservesExplicitChoice) {
+  for (const bool enabled : {false, true}) {
+    std::string merged;
+    std::string error;
+    const auto user = nlohmann::json({{"FFlagDebugLuauCodegenAll", enabled}});
+    ASSERT_TRUE(MergeDesktopAppPolicyClientSettingsOverride(
+        R"({"PlatformGroup":"Desktop"})", user.dump(), &merged, &error, false))
+        << error;
+    EXPECT_EQ(nlohmann::json::parse(merged)["FFlagDebugLuauCodegenAll"], enabled);
+  }
+}
+
 TEST(RobloxDesktopAppPolicyTest, RejectsMalformedOrSymlinkedStorage) {
   TemporaryDirectory temporary;
   const std::filesystem::path default_path = temporary.path() / "default.json";

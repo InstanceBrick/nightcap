@@ -44,7 +44,10 @@ class RobloxOutputDeviceBridge final {
                                     std::string_view logical_name,
                                     std::uintptr_t image_base);
   static int GetOutputDeviceCount(void* self);
-  static void* GetOutputDeviceInfo(void* result, void* self, int index);
+  // A trivial aggregate lets the compiler implement the guest's platform
+  // sret convention (x8 on AArch64, hidden first argument on x86-64).
+  struct alignas(8) DeviceInfoResult { std::uint8_t bytes[56]{}; };
+  static DeviceInfoResult GetOutputDeviceInfo(void* self, int index);
   static int GetCurrentOutputDevice(void* self);
   static void SetCurrentOutputDevice(void* self, int index);
 
@@ -52,7 +55,7 @@ class RobloxOutputDeviceBridge final {
   Status PatchVtableLocked();
   bool RestoreVtableLocked();
   static int GetInputDeviceCount(void *self);
-  static void *GetInputDeviceInfo(void *result, void *self, int index);
+  static DeviceInfoResult GetInputDeviceInfo(void* self, int index);
   static int GetCurrentInputDevice(void *self);
   static void SetCurrentInputDevice(void *self, int index);
   int DeviceCount(bool input = false);

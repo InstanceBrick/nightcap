@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include <string>
+#include <cstdlib>
 #include <utility>
 
 namespace mocktail {
@@ -20,7 +21,9 @@ Status MetadataError(const char* operation) {
 }  // namespace
 
 Status ConfigureSdlApplicationMetadata() {
-  if (!SDL_SetAppMetadata(kMocktailApplicationName, MOCKTAIL_PROJECT_VERSION,
+  const char* name=std::getenv("MOCKTAIL_VR_APPLICATION_NAME");
+  if(!name || !name[0])name=kMocktailApplicationName;
+  if (!SDL_SetAppMetadata(name, MOCKTAIL_PROJECT_VERSION,
                           kMocktailApplicationIdentifier)) {
     return MetadataError("SDL_SetAppMetadata");
   }

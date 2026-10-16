@@ -23,6 +23,7 @@
 #include "compat/build_profile.h"
 #include "mocktail/vr/roblox_vr_device_bridge.h"
 #include "vr/roblox_vr_device_bridge_internal.h"
+#include "projection_jitter_tests.h"
 
 namespace mocktail::vr {
 namespace internal {

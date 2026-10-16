@@ -28,6 +28,25 @@
 namespace mocktail::compat {
 namespace {
 
+TEST(HostAbiProfileTest, Arm3222PreservesReorderedNativeBootstrap) {
+  const auto* profile=FindHostAbiProfile("25aa7fd31008a744c3c99f717e7d16d81d371d12");
+  ASSERT_NE(profile,nullptr);
+  EXPECT_EQ(profile->default_allocator_strategy,HostAllocatorStrategy::kNativeMimalloc);
+  EXPECT_TRUE(profile->HasValidNativeMimallocConstructorRanges());
+  EXPECT_FALSE(profile->AllowsNativeMimallocConstructor(3));
+  // Allocator wiring is now 4, JNI singleton 5, lazy clock 6 and process load 7.
+  for (std::size_t index : {4,5,6,7,3672})
+    EXPECT_TRUE(profile->AllowsNativeMimallocConstructor(index));
+  EXPECT_FALSE(profile->AllowsNativeMimallocConstructor(3673));
+  EXPECT_FALSE(profile->ShouldInitializeNativeMimallocThreadAfterConstructor(4));
+  EXPECT_TRUE(profile->ShouldInitializeNativeMimallocThreadAfterConstructor(7));
+  EXPECT_FALSE(profile->AllowsConstructor(4));
+  EXPECT_TRUE(profile->AllowsConstructor(5));
+  EXPECT_FALSE(profile->AllowsConstructor(6));
+  EXPECT_TRUE(profile->AllowsConstructor(7));
+  EXPECT_TRUE(profile->HasValidNativePreJniBootstrap());
+}
+
 TEST(HostAbiProfileTest, Payload3092KeepsVerifiedConstructorBoundaries) {
   const auto* profile =
       FindHostAbiProfile("5f0704edd9064f566ee3d6df2bd2fabbcc709f03");

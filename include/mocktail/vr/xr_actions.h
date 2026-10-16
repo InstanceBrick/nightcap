@@ -29,7 +29,9 @@ public:
   // Creates the action set/actions and suggests bindings. Instance-level:
   // valid before any session exists. Failure is non-fatal for XR output; the
   // backend logs and continues without controller input.
-  Status Create(void *xr_instance);
+  Status Create(void *xr_instance, bool enable_eye_gaze=false);
+  struct EyeGazePose {float orientation[4]={0,0,0,1};bool valid=false;std::uint64_t frame=0;};
+  const EyeGazePose& eye_gaze() const {return eye_gaze_;}
 
   // Attaches to a session and creates the per-hand pose spaces. Must be
   // called after xrCreateSession and before the first Sync; recreated on every
@@ -90,6 +92,7 @@ private:
   ControllerStateBuilder builder_;
   ControllerSnapshot snapshot_;
   VrHandPose hands_[2];
+  EyeGazePose eye_gaze_;
   ControllerDeliveryQueue delivery_queue_;
   std::uint64_t session_generation_ = 0;
   // Last connection level handed to the consumer, to mark connection changes.

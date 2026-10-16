@@ -7,6 +7,7 @@
 
 #include "compat/build_profile.h"
 #include "mocktail/vr/xr_controller.h"
+#include "mocktail/vr/vr_pose_math.h"
 
 namespace mocktail::vr { struct ScriptedPoseSample; }
 namespace mocktail::vr::internal {
@@ -33,6 +34,18 @@ struct VrBuildContract {
 };
 
 const VrBuildContract* FindVrBuildContract(std::string_view build_id);
+bool HasExpectedNativeProjectionContract(const std::uint8_t* code,
+                                         std::size_t size,
+                                         std::string_view build_id);
+bool HasExpectedNativeViewProjectionContract(const std::uint8_t* code,
+                                             std::size_t size,
+                                             std::string_view build_id);
+bool HasExpectedNativeMotionConstructorContract(const std::uint8_t* code,
+                                                std::size_t size,
+                                                std::string_view build_id);
+bool HasExpectedNativeMotionSetupContract(const std::uint8_t* code,
+                                          std::size_t size,
+                                          std::string_view build_id);
 
 // The hand the pointer service asks about: 1 left, 2 right.
 int ReadPointerHandIndex(const void* service, const VrBuildContract& contract);
@@ -42,6 +55,11 @@ float ReadCameraHeadScale(const void* camera, const VrBuildContract& contract);
 // at `name` inside the image. Returns whether it wrote.
 bool EnableNamedFastFlag(std::uintptr_t image_base, std::uintptr_t rva,
                          std::string_view name);
+// A caller must first pin the property's int32 type to the exact native build.
+// This checks its full name address and writes all four value bytes.
+bool SetNamedFastInt32(std::uintptr_t image_base, std::uintptr_t rva,
+                       std::string_view name, std::uintptr_t name_rva,
+                       std::int32_t value);
 
 // HapticService:SetMotor arguments the Android client drops: its haptics
 // backend only consumes Gamepad1 Large/Small, so LeftHand/RightHand need a
@@ -154,10 +172,21 @@ inline constexpr std::size_t kStateGetterVtableSlot = 0x28;
 inline constexpr std::size_t kEyeGetterVtableSlot = 0x48;
 inline constexpr std::size_t kEyeInitializerVtableSlot = 0xd0;
 
+#if defined(__aarch64__)
+inline constexpr std::size_t kStateGetterContractSize = 16;
+inline constexpr std::size_t kEyeGetterContractSize = 12;
+inline constexpr std::size_t kConstructorContractSize = 0x290;
+inline constexpr std::size_t kInitializerContractSize = 0x24c;
+inline constexpr std::size_t kPointerGetterContractSize = 0x108;
+inline constexpr std::size_t kHapticContractSize = 4;
+#else
 inline constexpr std::size_t kStateGetterContractSize = 33;
 inline constexpr std::size_t kEyeGetterContractSize = 16;
 inline constexpr std::size_t kConstructorContractSize = 664;
 inline constexpr std::size_t kInitializerContractSize = 700;
+inline constexpr std::size_t kPointerGetterContractSize = 0x1b2;
+inline constexpr std::size_t kHapticContractSize = 1;
+#endif
 
 enum class EyeResourceState { kEmpty, kReady, kInvalid };
 // Reads only the current live object's ABI bytes. A ready byte alone is

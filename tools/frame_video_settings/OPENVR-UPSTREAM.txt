@@ -1,0 +1,4 @@
+OpenVR header: ValveSoftware/openvr, API 2.1.0, copyright Valve Corporation.
+https://github.com/ValveSoftware/openvr
+Local header SHA-256: daddc69aa99eaa068442a6c6c9a66bc1ea30ec539eff1b3c2dd17ae362cab562
+License: BSD-3-Clause, reproduced in OPENVR-LICENSE.txt.

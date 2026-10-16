@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdint>
@@ -63,6 +64,7 @@ void* mocktail_gameactivity_on_trim_memory_native = nullptr;
 }
 
 namespace {
+float NativeVrRefreshRate();
 thread_local JNIEnv* g_thread_local_env = nullptr;
 thread_local JNIEnv g_thread_env_storage = {};
 thread_local VM* g_thread_vm_instance = nullptr;
@@ -318,7 +320,8 @@ jint IntResultForName(jmethodID method_id) {
     return 33;
   }
   if (method == JniMethod::kGetRefreshRate) {
-    return 60;
+    const float hz=NativeVrRefreshRate();
+    return hz>0.f?static_cast<jint>(hz+.5f):60;
   }
   if (method == JniMethod::kGetSdkVersion) {
     return 33;
@@ -339,6 +342,14 @@ jint IntResultForName(jmethodID method_id) {
   }
   MarkCallUnhandled();
   return 0;
+}
+
+float NativeVrRefreshRate() {
+  const char* enabled=std::getenv("MOCKTAIL_VR_ENABLED");
+  const char* text=std::getenv("MOCKTAIL_VR_DISPLAY_HZ");
+  if(!enabled || std::strcmp(enabled,"1")!=0 || !text)return 0.f;
+  char* end=nullptr;const float hz=std::strtof(text,&end);
+  return end && *end=='\0' && std::isfinite(hz) && hz>=30.f && hz<=240.f?hz:0.f;
 }
 
 jint IntResultForMethod(jmethodID method_id) {
@@ -4226,6 +4237,9 @@ jfloat FloatResultForReceiverMethod(jobject obj, jmethodID method_id) {
   const char* name = MethodName(method_id);
   if (!name) {
     return 0.0f;
+  }
+  if(std::strcmp(name,"getRefreshRate")==0) {
+    const float hz=NativeVrRefreshRate();if(hz>0.f)return hz;
   }
   jfloat value = FloatFieldValue(obj, name);
   if (value != 0.0f) {

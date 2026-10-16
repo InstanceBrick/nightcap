@@ -308,3 +308,43 @@ TEST(BionicHostLibcRuntimeTest, FortifiedReadlinkAbortsAboveSsizeLimit) {
 }
 
 } // namespace
+
+
+#include "compat/allocator_snapshot_cache.h"
+#include <future>
+#include <chrono>
+#include <thread>
+
+TEST(AllocatorSnapshotCacheTest, ReusesACompleteSampleAndRefreshesAfterHalfASecond) {
+  mocktail::compat::AllocatorSnapshotCache cache;
+  unsigned calls=0;
+  const auto reader=[&]() noexcept {
+    ++calls;return mocktail::compat::BionicMallinfoSnapshot{calls,calls+1,calls+2,calls+3,calls+4,calls+5,calls+6,calls+7,calls+8,calls+9};
+  };
+  const auto first=cache.Read(0,reader);
+  EXPECT_EQ(first.arena,1);EXPECT_EQ(first.keepcost,10);
+  for(unsigned i=1;i<500;++i){const auto cached=cache.Read(i*1'000'000ULL,reader);EXPECT_EQ(cached.uordblks,8);}
+  EXPECT_EQ(calls,1);
+  const auto updated=cache.Read(500'000'000ULL,reader);
+  EXPECT_EQ(calls,2);EXPECT_EQ(updated.arena,2);EXPECT_EQ(updated.keepcost,11);
+}
+TEST(AllocatorSnapshotCacheTest, ReadersDoNotWaitForAnInProgressHeapScan) {
+  mocktail::compat::AllocatorSnapshotCache cache;
+  const auto previous=cache.Read(0,[]() noexcept {mocktail::compat::BionicMallinfoSnapshot value{};value.uordblks=123;return value;});
+  std::promise<void> entered,release;
+  auto gate=release.get_future().share();
+  auto scan=std::async(std::launch::async,[&] {
+    return cache.Read(1'000'000'000ULL,[&]() noexcept {
+      entered.set_value();gate.wait();mocktail::compat::BionicMallinfoSnapshot value{};value.uordblks=456;return value;
+    });
+  });
+  entered.get_future().wait();
+  auto read=std::async(std::launch::async,[&] {
+    return cache.Read(1'000'000'001ULL,[]() noexcept {std::abort();return mocktail::compat::BionicMallinfoSnapshot{};});
+  });
+  const bool ready=read.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+  release.set_value();
+  EXPECT_TRUE(ready);EXPECT_EQ(read.get().uordblks,previous.uordblks);
+  EXPECT_EQ(scan.get().uordblks,456);
+  EXPECT_EQ(cache.Read(1'000'000'002ULL,[]() noexcept {return mocktail::compat::BionicMallinfoSnapshot{};}).uordblks,456);
+}

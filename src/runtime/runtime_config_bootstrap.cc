@@ -47,7 +47,7 @@ device: pc-windows-11
 runtime:
   # Boolean (default: false): start without a visible SDL window.
   headless: false
-  # String (optional): use a specific x86_64 libroblox.so instead of the
+  # String (optional): use a specific native-architecture libroblox.so instead of the
   # active verified payload.
   # roblox_library: /absolute/path/to/libroblox.so
 
@@ -73,18 +73,17 @@ graphics:
 
 # vr:
   # String (default: off): experimental VR through OpenXR on supported Roblox
-  # builds. off always starts on the desktop. on always starts in VR, like
-  # --vr. auto starts in VR when SteamVR is already running with a connected
+  # builds (ARM64: 2998 and 3222). off starts on the desktop; on starts in
+  # VR like --vr. auto starts in VR when SteamVR is already running with a connected
   # headset (ALVR included), and on the desktop otherwise. auto never starts
   # SteamVR. --vr and --no-vr override this for one launch. The older
   # enabled: true/false still works as on/off; set one or the other.
   # Standalone OpenXR test scene: mocktail-vr-probe --scene.
   # mode: off
   # String (default: fxaa): smooth jagged edges in the headset. Roblox draws
-  # the VR eyes without anti-aliasing, so each eye is filtered on its way to
-  # the headset. fxaa is the cheapest. smaa finds edges more precisely and
-  # keeps text and fine detail sharper, at a little more GPU time. off sends
-  # the eyes as rendered.
+  # the VR eyes without anti-aliasing; fxaa filters each eye on its way to the
+  # headset. The Steam Frame profile uses its separate gaze AA control.
+  # off sends the eyes as rendered.
   # anti_aliasing: fxaa
   # Optional string or integer: frame-rate limit used instead of
   # graphics.frame_rate_limit while VR is active. Same values: -1 (Roblox's

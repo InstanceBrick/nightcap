@@ -373,6 +373,34 @@ TEST(PerformancePolicyTest,
   EXPECT_FALSE(MergeVrClientSettingsOverrides(true, "bad", &merged, &error));
 }
 
+TEST(PerformancePolicyTest, VrTemporalCaptureDisablesConflictingMemorylessFlag) {
+  std::string merged, error;
+  const char* key = "FFlagVulkanLazilyAllocatedTextureSupport";
+  ASSERT_TRUE(MergeVrClientSettingsOverrides(
+      true, R"({"FFlagVulkanLazilyAllocatedTextureSupport":"True","FIntOther":"7"})",
+      &merged, &error, true)) << error;
+  auto json = nlohmann::json::parse(merged);
+  EXPECT_EQ(json[key], "False");
+  EXPECT_EQ(json["FIntOther"], "7");
+  ASSERT_TRUE(MergeVrClientSettingsOverrides(true, "{}", &merged, &error, true));
+  EXPECT_EQ(nlohmann::json::parse(merged)[key], "False");
+  // The same merge is applied to both native settings channels before startup.
+  ASSERT_TRUE(MergeVrClientSettingsOverrides(true, merged, &merged, &error, true));
+  EXPECT_EQ(nlohmann::json::parse(merged)[key], "False");
+}
+
+TEST(PerformancePolicyTest, NonVrOrNoTemporalCapturePreservesMemorylessPolicy) {
+  for (const auto active : {false, true}) {
+    std::string merged, error;
+    ASSERT_TRUE(MergeVrClientSettingsOverrides(
+        active, R"({"FFlagVulkanLazilyAllocatedTextureSupport":"True"})",
+        &merged, &error, !active));
+    EXPECT_EQ(nlohmann::json::parse(merged)["FFlagVulkanLazilyAllocatedTextureSupport"], "True");
+    ASSERT_TRUE(MergeVrClientSettingsOverrides(active, "{}", &merged, &error, !active));
+    EXPECT_FALSE(nlohmann::json::parse(merged).contains("FFlagVulkanLazilyAllocatedTextureSupport"));
+  }
+}
+
 TEST(PerformancePolicyTest, NonVrPreservesStartupRenderingPolicy) {
   std::string merged, error;
   ASSERT_TRUE(MergeVrClientSettingsOverrides(

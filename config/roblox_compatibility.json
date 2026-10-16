@@ -77,7 +77,20 @@
       "allow_legacy_binary_patches": false,
       "allow_host_abi_bridges": true,
       "allow_host_constructor_replay": true,
-      "reason": "AArch64 arm64-v8a payload of the same 2.736.1408 release as the verified x86-64 profile; allocator, constructor replay, and pre-JNI bootstrap RVAs were derived by cross-architecture semantic matching."
+      "reason": "AArch64 arm64-v8a payload of the same 2.736.1408 release as the verified x86-64 profile; allocator, constructor replay, and pre-JNI bootstrap RVAs were derived by cross-architecture semantic matching.",
+      "fmod_output_device_bridge": {
+        "vtable_rva": "0x632aeb0",
+        "string_constructor_rva": "0x1d5a6b0",
+        "count_method_rva": "0x2f96540",
+        "info_method_rva": "0x2f96600",
+        "current_method_rva": "0x2f965a0",
+        "select_method_rva": "0x2f962d4",
+        "input_count_method_rva": "0x2f968b4",
+        "input_info_method_rva": "0x2f968c4",
+        "input_current_method_rva": "0x2f9697c",
+        "input_select_method_rva": "0x2f96088",
+        "vtable_layout_version": 1
+      }
     },
     {
       "version_name": "2.736.1408",
@@ -140,6 +153,40 @@
         "eye_getter_rva": "0x37fa3b6",
         "eye_initializer_rva": "0x37fa3e8",
         "emulator_flag_storage_rva": "0x73f4690",
+        "device_create_framebuffer_vtable_offset": "0x188"
+      }
+    },
+    {
+      "version_name": "2.742.1059",
+      "version_code": 3222,
+      "abi": "arm64-v8a",
+      "elf_build_id": "25aa7fd31008a744c3c99f717e7d16d81d371d12",
+      "status": "supported",
+      "default_allowed": true,
+      "allow_legacy_binary_patches": false,
+      "allow_host_abi_bridges": true,
+      "allow_host_constructor_replay": true,
+      "reason": "Verified on Steam Frame 2026-10-15: signed ARM64 3222 payload, exact allocator/bootstrap and reordered constructor roles, VR state/pointer/reflection/framebuffer contracts and layout-2 FMOD bridge; native startup, two distinct eye bindings at 2592x2592, real OpenXR projection and controlled experience transitions. Worn-headset quality and remote voice audibility remain unconfirmed.",
+      "fmod_output_device_bridge": {
+        "vtable_rva": "0x6569770",
+        "string_constructor_rva": "0x1e47180",
+        "count_method_rva": "0x2c35714",
+        "info_method_rva": "0x2c357d4",
+        "current_method_rva": "0x2c35774",
+        "select_method_rva": "0x2c34f18",
+        "input_count_method_rva": "0x2c35d58",
+        "input_info_method_rva": "0x2c35d68",
+        "input_current_method_rva": "0x2c361a0",
+        "input_select_method_rva": "0x2c34c80",
+        "vtable_layout_version": 2
+      },
+      "vr_debug_device_bridge": {
+        "vtable_rva": "0x67b6688",
+        "constructor_rva": "0x4e5558c",
+        "state_getter_rva": "0x4e55964",
+        "eye_getter_rva": "0x4e55958",
+        "eye_initializer_rva": "0x4e55974",
+        "emulator_flag_storage_rva": "0x6c0d1b0",
         "device_create_framebuffer_vtable_offset": "0x188"
       }
     }

@@ -1462,8 +1462,8 @@ Status RobloxExperienceComposition::DrainLaunchRequests() {
     if (!launch_in_progress_ && active_launch_ == nullptr && game_active_ &&
         !pending_launch_requests_.empty()) {
       // Blocks a reentrant drain while the leave pumps main-thread messages.
-      // The leave ends in the Native stage with no Lua app return, so the
-      // queued launch starts on the next drain.
+      // Blocking native leave can complete without a Lua app return; async
+      // clients continue waiting for their explicit return callback.
       controlled_switch_waiting_for_return_ = true;
       switch_active_game = true;
     }
@@ -1472,9 +1472,18 @@ Status RobloxExperienceComposition::DrainLaunchRequests() {
     std::fprintf(stderr,
                  "[experience] leaving active game for queued launch\n");
     const Status leave_status = LeaveGame();
-    {
+    const char* blocking_leave =
+        std::getenv("MOCKTAIL_GAME_LEAVE_COMPLETES_WITHOUT_LUA_CALLBACK");
+    if (!leave_status.ok() ||
+        (blocking_leave != nullptr && std::string(blocking_leave) == "1")) {
       std::lock_guard<std::mutex> lock(mutex_);
       controlled_switch_waiting_for_return_ = false;
+      // The pinned ARM client completes a blocking native leave into its
+      // Native stage. It does not navigate to LuaApp or emit gameDidLeave.
+      // The completed native call is the boundary for a direct next launch.
+      // Other client contracts continue to require the explicit callback.
+      if (leave_status.ok())
+        lua_app_return_pending_ = false;
     }
     return leave_status;
   }

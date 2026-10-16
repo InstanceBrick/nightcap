@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform itexture2D blockFlow;
+layout(set=0,binding=1) uniform utexture2D sceneChange;
+layout(set=0,binding=2,rg16f) writeonly uniform image2D pixelMotion;
+layout(set=0,binding=3,r8) writeonly uniform image2D reactiveMask;
+layout(push_constant) uniform Parameters {
+  ivec2 renderSize;
+  ivec2 flowSize;
+  vec2 currentMinusPreviousJitter;
+  uint resetHistory;
+  uint reserved;
+} parameters;
+
+vec2 Flow(ivec2 position) {
+  return vec2(texelFetch(blockFlow,clamp(position,ivec2(0),parameters.flowSize-1),0).xy);
+}
+void main() {
+  ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(pixel,parameters.renderSize)))return;
+  // AMD's signed block flow is measured in input pixels, current -> previous.
+  // Sampling block centres reconstructs a continuous render-resolution field.
+  vec2 block=(vec2(pixel)+.5)/8.0-.5;
+  ivec2 base=ivec2(floor(block));
+  vec2 fraction=fract(block);
+  vec2 motion=mix(mix(Flow(base),Flow(base+ivec2(1,0)),fraction.x),
+                  mix(Flow(base+ivec2(0,1)),Flow(base+ivec2(1,1)),fraction.x),fraction.y);
+  // Flow sees jittered images. Remove previousJitter-currentJitter to supply
+  // the unjittered backward motion expected by the upscaler's selected variant.
+  motion+=parameters.currentMinusPreviousJitter;
+  bool reset=parameters.resetHistory!=0u ||
+      (texelFetch(sceneChange,ivec2(1,0),0).r&15u)!=0u;
+  if(reset)motion=vec2(0);
+  imageStore(pixelMotion,pixel,vec4(motion,0,0));
+  // Scene cuts invalidate accumulation without a CPU readback or GPU wait.
+  imageStore(reactiveMask,pixel,vec4(reset?1.0:0.0));
+}

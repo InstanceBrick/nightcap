@@ -9,6 +9,7 @@
 
 #include "compat/build_profile.h"
 #include "mocktail/status.h"
+#include "mocktail/vr/roblox_vr_guest_abi.h"
 
 namespace mocktail::vr {
 namespace internal {
@@ -34,7 +35,7 @@ std::string DescribeSupportedVrBuilds();
 // observed presenting.
 class RobloxVrDeviceBridge final {
 public:
-  using StateGetterFn = void *(*)(void *result_buffer, void *device_object);
+  using StateGetterFn = guest_abi::StateGetterFn;
   using EyeGetterFn = void *(*)(void *device_object, int eye_index);
   using EyeInitializerFn = void (*)(void *device_object, void *graphics_device);
 

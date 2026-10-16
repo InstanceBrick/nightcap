@@ -96,6 +96,8 @@ struct XrActions::Impl {
   XrAction face_y = XR_NULL_HANDLE;
   XrAction menu = XR_NULL_HANDLE;
   XrAction haptic = XR_NULL_HANDLE;
+  XrAction eye_gaze = XR_NULL_HANDLE;
+  XrSpace eye_space = XR_NULL_HANDLE;
   XrPath subaction_left = XR_NULL_PATH;
   XrPath subaction_right = XR_NULL_PATH;
 
@@ -118,7 +120,7 @@ struct XrActions::Impl {
 
 XrActions::~XrActions() { Destroy(); }
 
-Status XrActions::Create(void *xr_instance) {
+Status XrActions::Create(void *xr_instance, bool enable_eye_gaze) {
   if (created_) {
     return Status::Ok();
   }
@@ -135,7 +137,7 @@ Status XrActions::Create(void *xr_instance) {
         XrInfo<XrActionSetCreateInfo>(XR_TYPE_ACTION_SET_CREATE_INFO);
     std::strncpy(set_info.actionSetName, "mocktail_vr",
                  XR_MAX_ACTION_SET_NAME_SIZE - 1);
-    std::strncpy(set_info.localizedActionSetName, "Mocktail VR controls",
+    std::strncpy(set_info.localizedActionSetName, "Nightcap Roblox VR controls",
                  XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
     set_info.priority = 0;
     CheckXr(instance, xrCreateActionSet(instance, &set_info, &impl_->set),
@@ -186,6 +188,12 @@ Status XrActions::Create(void *xr_instance) {
     for (std::size_t i = 0; i < std::size(touch_names); ++i)
       impl_->touches[i] = make(XR_ACTION_TYPE_BOOLEAN_INPUT, touch_names[i]);
     impl_->haptic = make(XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic");
+    if(enable_eye_gaze) {
+      auto gaze=XrInfo<XrActionCreateInfo>(XR_TYPE_ACTION_CREATE_INFO);
+      gaze.actionType=XR_ACTION_TYPE_POSE_INPUT;
+      std::strcpy(gaze.actionName,"eye_gaze");std::strcpy(gaze.localizedActionName,"Eye gaze");
+      if(XR_FAILED(xrCreateAction(impl_->set,&gaze,&impl_->eye_gaze)))impl_->eye_gaze=XR_NULL_HANDLE;
+    }
 
     auto path = [&](const char *text) {
       XrPath result = XR_NULL_PATH;
@@ -249,6 +257,10 @@ Status XrActions::Create(void *xr_instance) {
     };
 
     const XrPath l_grip = path("/user/hand/left/input/grip/pose");
+    if(impl_->eye_gaze) {
+      suggest("/interaction_profiles/ext/eye_gaze_interaction",{{impl_->eye_gaze,path("/user/eyes_ext/input/gaze_ext/pose")}});
+      Log("  [vr-input] direct eye-gaze pose action created\n");
+    }
     const XrPath r_grip = path("/user/hand/right/input/grip/pose");
     const XrPath l_aim = path("/user/hand/left/input/aim/pose");
     const XrPath r_aim = path("/user/hand/right/input/aim/pose");
@@ -377,6 +389,11 @@ Status XrActions::Attach(void *xr_instance, void *xr_session,
     attach_info.actionSets = &impl_->set;
     CheckXr(instance, xrAttachSessionActionSets(session, &attach_info),
             "xrAttachSessionActionSets");
+    if(impl_->eye_gaze) {
+      auto info=XrInfo<XrActionSpaceCreateInfo>(XR_TYPE_ACTION_SPACE_CREATE_INFO);
+      info.action=impl_->eye_gaze;info.poseInActionSpace.orientation.w=1.f;
+      if(XR_FAILED(xrCreateActionSpace(session,&info,&impl_->eye_space)))impl_->eye_space=XR_NULL_HANDLE;
+    }
 
     for (int hand = 0; hand < 2; ++hand) {
       const XrPath subaction =
@@ -410,6 +427,7 @@ Status XrActions::Attach(void *xr_instance, void *xr_session,
 }
 
 void XrActions::ResetInput() {
+  eye_gaze_={};
   const bool had_input =
       snapshot_.hands[0].connected || snapshot_.hands[1].connected;
   const auto frame = snapshot_.frame;
@@ -447,6 +465,7 @@ void XrActions::Detach() {
     attached_ = false;
     return;
   }
+  if(impl_->eye_space) {(void)xrDestroySpace(impl_->eye_space);impl_->eye_space=XR_NULL_HANDLE;}
   // Haptics must not outlive the session.
   if (attached_ && impl_->session != XR_NULL_HANDLE) {
     for (int hand = 0; hand < 2; ++hand) {
@@ -502,6 +521,7 @@ void XrActions::Destroy() {
       for (const auto action : impl_->touches)
         if (action != XR_NULL_HANDLE)
           (void)xrDestroyAction(action);
+      if(impl_->eye_gaze)(void)xrDestroyAction(impl_->eye_gaze);
       if (impl_->set != XR_NULL_HANDLE) {
         (void)xrDestroyActionSet(impl_->set);
       }
@@ -595,6 +615,17 @@ bool XrActions::Sync(void *xr_session, std::uint64_t predicted_display_time,
       return false;
     }
 
+    eye_gaze_={};
+    if(impl_->eye_gaze && impl_->eye_space) {
+      auto get=XrInfo<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);get.action=impl_->eye_gaze;
+      auto state=XrInfo<XrActionStatePose>(XR_TYPE_ACTION_STATE_POSE);
+      auto location=XrInfo<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
+      auto sample=XrInfo<XrEyeGazeSampleTimeEXT>(XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT);location.next=&sample;
+      if(XR_SUCCEEDED(xrGetActionStatePose(session,&get,&state)) && state.isActive && XR_SUCCEEDED(xrLocateSpace(impl_->eye_space,impl_->local_space,time,&location)) && (location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+        eye_gaze_.orientation[0]=location.pose.orientation.x;eye_gaze_.orientation[1]=location.pose.orientation.y;eye_gaze_.orientation[2]=location.pose.orientation.z;eye_gaze_.orientation[3]=location.pose.orientation.w;
+        eye_gaze_.valid=true;eye_gaze_.frame=frame;
+      }
+    }
     for (int hand = 0; hand < 2; ++hand) {
       const XrPath subaction =
           hand == 0 ? impl_->subaction_left : impl_->subaction_right;

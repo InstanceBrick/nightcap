@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -21,16 +23,24 @@
 #include <utility>
 #include <vector>
 
+#include "mocktail/graphics/vulkan_barrier_adjustment.h"
+#include "mocktail/graphics/vulkan_foveation_device_policy.h"
 #include "mocktail/graphics/android_vulkan_wsi_adapter.h"
 #include "mocktail/graphics/chrome_trace_writer.h"
 #include "mocktail/graphics/present_mode_policy.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/vulkan_text_overlay_compositor.h"
 #include "mocktail/platform/platform_runtime.h"
+#include "mocktail/vr/foveation_focus.h"
+#include "mocktail/vr/foveation_msaa_contract.h"
+#include "mocktail/vr/foveation_tile_bounds.h"
+#include "mocktail/vr/fsr3_scene_inputs.h"
 
 extern "C" {
 VKAPI_ATTR VkResult VKAPI_CALL
 mocktail_vulkan_idle_synchronized(PFN_vkDeviceWaitIdle raw, VkDevice device);
+VKAPI_ATTR std::int32_t mocktail_vulkan_run_queue_synchronized(
+    VkDevice device, VkQueue queue, std::int32_t (*operation)(void *), void *context);
 VKAPI_ATTR VkResult VKAPI_CALL mocktail_vulkan_submit_synchronized(
     PFN_vkQueueSubmit raw, VkDevice device, VkQueue queue, uint32_t count,
     const VkSubmitInfo *submits, VkFence fence);
@@ -178,9 +188,27 @@ VKAPI_ATTR void VKAPI_CALL
 vkCmdBeginRenderPass(VkCommandBuffer command_buffer,
                      const VkRenderPassBeginInfo* begin_info,
                      VkSubpassContents contents);
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer command_buffer);
+VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer,VkPipelineBindPoint,VkPipeline);
+VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer,uint32_t,uint32_t,uint32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer,uint32_t,uint32_t,uint32_t,int32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer,VkBuffer,VkDeviceSize,uint32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer,VkBuffer,VkDeviceSize,uint32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer,VkBuffer,VkDeviceSize,VkBuffer,VkDeviceSize,uint32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer,VkBuffer,VkDeviceSize,VkBuffer,VkDeviceSize,uint32_t,uint32_t);
+VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice,VkPipeline,const VkAllocationCallbacks*);
+VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice,VkShaderModule,const VkAllocationCallbacks*);
 }
 
 namespace {
+bool FovTraceEnabled();
+bool Fsr3InputsAvailable();
+bool Fsr3InputsEnabled();
+bool Fsr3ShaderDumpEnabled();
+void Fsr3DumpShader(VkDevice,VkShaderModule,const VkShaderModuleCreateInfo*);
+void Fsr3DumpGraphicsPipelines(VkDevice,unsigned,const VkGraphicsPipelineCreateInfo*,const VkPipeline*);
+void Fsr3ResetCommand(VkCommandBuffer);
+void FovTraceComplete(VkDevice,VkQueue);
 
 using BackendWindowFn = void* (*)();
 using UsesDirectVulkanFn = bool (*)();
@@ -195,7 +223,7 @@ using VrXrCreateDeviceFn = bool (*)(VkPhysicalDevice,
                                     const VkDeviceCreateInfo*,
                                     const VkAllocationCallbacks*, VkDevice*,
                                     VkResult*);
-using VrXrNoteDeviceDestroyedFn = void (*)(VkDevice);
+using VrXrNoteDeviceDestroyedFn = bool (*)(VkDevice);
 using VrXrNoteQueueFn = void (*)(VkDevice, VkQueue, std::uint32_t,
                                  std::uint32_t);
 using VrXrRecordImageFn = void (*)(VkDevice, VkImage,
@@ -249,7 +277,20 @@ struct AdapterState {
     PFN_vkDestroyFramebuffer destroy_framebuffer = nullptr;
     PFN_vkCreateRenderPass create_render_pass = nullptr;
     PFN_vkDestroyRenderPass destroy_render_pass = nullptr;
+    PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
+    PFN_vkCmdPipelineBarrier2 cmd_pipeline_barrier2 = nullptr;
+    PFN_vkCmdPipelineBarrier2KHR cmd_pipeline_barrier2_khr = nullptr;
     PFN_vkCmdBeginRenderPass cmd_begin_render_pass = nullptr;
+    PFN_vkCmdEndRenderPass cmd_end_render_pass = nullptr;
+    PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+    PFN_vkCmdDraw cmd_draw = nullptr;
+    PFN_vkCmdDrawIndexed cmd_draw_indexed = nullptr;
+    PFN_vkCmdDrawIndirect cmd_draw_indirect = nullptr;
+    PFN_vkCmdDrawIndexedIndirect cmd_draw_indexed_indirect = nullptr;
+    PFN_vkCmdDrawIndirectCount cmd_draw_indirect_count = nullptr;
+    PFN_vkCmdDrawIndexedIndirectCount cmd_draw_indexed_indirect_count = nullptr;
+    PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+    PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
   };
 
   struct QueueBinding {
@@ -424,11 +465,20 @@ bool EnsureInitialized() {
           VkFence))>("mocktail_vr_xr_queue_submit_adapter");
   if (register_submit)
     register_submit(mocktail_vulkan_submit_synchronized);
+  const auto register_operation = ResolveProcessFunction<void (*)(
+      std::int32_t (*)(VkDevice, VkQueue, std::int32_t (*)(void *), void *))>(
+      "mocktail_vr_xr_queue_operation_adapter");
+  if (register_operation)
+    register_operation(mocktail_vulkan_run_queue_synchronized);
   const auto register_idle = ResolveProcessFunction<void (*)(
       VkResult(VKAPI_PTR *)(PFN_vkDeviceWaitIdle, VkDevice))>(
       "mocktail_vr_xr_device_idle_adapter");
   if (register_idle)
     register_idle(mocktail_vulkan_idle_synchronized);
+  if(FovTraceEnabled()) {
+    const auto report=ResolveProcessFunction<void(*)(void(*)(VkDevice,VkQueue))>("mocktail_vr_xr_pass_timing_reporter");
+    if(report)report(FovTraceComplete);
+  }
 
   const BackendWindowFn backend_window =
       ResolveProcessFunction<BackendWindowFn>("mocktail_window_backend_window");
@@ -809,8 +859,43 @@ void RegisterHostDeviceDispatch(VkDevice device,
       get_device_proc_addr(device, "vkCreateRenderPass"));
   dispatch.destroy_render_pass = reinterpret_cast<PFN_vkDestroyRenderPass>(
       get_device_proc_addr(device, "vkDestroyRenderPass"));
+  dispatch.cmd_pipeline_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
+      get_device_proc_addr(device, "vkCmdPipelineBarrier"));
+  dispatch.cmd_pipeline_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
+      get_device_proc_addr(device, "vkCmdPipelineBarrier2"));
+  dispatch.cmd_pipeline_barrier2_khr = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
+      get_device_proc_addr(device, "vkCmdPipelineBarrier2KHR"));
   dispatch.cmd_begin_render_pass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(
       get_device_proc_addr(device, "vkCmdBeginRenderPass"));
+  dispatch.cmd_end_render_pass = reinterpret_cast<PFN_vkCmdEndRenderPass>(
+      get_device_proc_addr(device, "vkCmdEndRenderPass"));
+  dispatch.cmd_bind_pipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(
+      get_device_proc_addr(device, "vkCmdBindPipeline"));
+  dispatch.cmd_draw = reinterpret_cast<PFN_vkCmdDraw>(
+      get_device_proc_addr(device, "vkCmdDraw"));
+  dispatch.cmd_draw_indexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(
+      get_device_proc_addr(device, "vkCmdDrawIndexed"));
+  dispatch.cmd_draw_indirect = reinterpret_cast<PFN_vkCmdDrawIndirect>(
+      get_device_proc_addr(device, "vkCmdDrawIndirect"));
+  dispatch.cmd_draw_indexed_indirect = reinterpret_cast<PFN_vkCmdDrawIndexedIndirect>(
+      get_device_proc_addr(device, "vkCmdDrawIndexedIndirect"));
+  dispatch.cmd_draw_indirect_count = reinterpret_cast<PFN_vkCmdDrawIndirectCount>(
+      get_device_proc_addr(device, "vkCmdDrawIndirectCount"));
+  dispatch.cmd_draw_indexed_indirect_count = reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCount>(
+      get_device_proc_addr(device, "vkCmdDrawIndexedIndirectCount"));
+  dispatch.destroy_pipeline = reinterpret_cast<PFN_vkDestroyPipeline>(
+      get_device_proc_addr(device, "vkDestroyPipeline"));
+  dispatch.destroy_shader_module = reinterpret_cast<PFN_vkDestroyShaderModule>(
+      get_device_proc_addr(device, "vkDestroyShaderModule"));
+  if(!dispatch.cmd_draw_indirect_count)dispatch.cmd_draw_indirect_count=reinterpret_cast<PFN_vkCmdDrawIndirectCount>(
+      get_device_proc_addr(device,"vkCmdDrawIndirectCountKHR"));
+  if(!dispatch.cmd_draw_indirect_count)dispatch.cmd_draw_indirect_count=reinterpret_cast<PFN_vkCmdDrawIndirectCount>(
+      get_device_proc_addr(device,"vkCmdDrawIndirectCountAMD"));
+  if(!dispatch.cmd_draw_indexed_indirect_count)dispatch.cmd_draw_indexed_indirect_count=reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCount>(
+      get_device_proc_addr(device,"vkCmdDrawIndexedIndirectCountKHR"));
+  if(!dispatch.cmd_draw_indexed_indirect_count)dispatch.cmd_draw_indexed_indirect_count=reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCount>(
+      get_device_proc_addr(device,"vkCmdDrawIndexedIndirectCountAMD"));
+
 
   AdapterState& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -1068,6 +1153,18 @@ PFN_vkVoidFunction AdapterProc(const char* name) {
   MOCKTAIL_VK_PROC(vkCreateRenderPass)
   MOCKTAIL_VK_PROC(vkDestroyRenderPass)
   MOCKTAIL_VK_PROC(vkCmdBeginRenderPass)
+  if (FovTraceEnabled() || Fsr3InputsAvailable()) { MOCKTAIL_VK_PROC(vkCmdEndRenderPass) }
+  if (Fsr3InputsAvailable()) {
+    MOCKTAIL_VK_PROC(vkCmdBindPipeline)
+    MOCKTAIL_VK_PROC(vkCmdDraw)
+    MOCKTAIL_VK_PROC(vkCmdDrawIndexed)
+    MOCKTAIL_VK_PROC(vkCmdDrawIndirect)
+    MOCKTAIL_VK_PROC(vkCmdDrawIndexedIndirect)
+    MOCKTAIL_VK_PROC(vkCmdDrawIndirectCount)
+    MOCKTAIL_VK_PROC(vkCmdDrawIndexedIndirectCount)
+    MOCKTAIL_VK_PROC(vkDestroyPipeline)
+    MOCKTAIL_VK_PROC(vkDestroyShaderModule)
+  }
   MOCKTAIL_VK_PROC(vkBindBufferMemory)
   MOCKTAIL_VK_PROC(vkBindBufferMemory2)
   MOCKTAIL_VK_PROC(vkMapMemory)
@@ -1094,6 +1191,12 @@ PFN_vkVoidFunction AdapterProc(const char* name) {
                     vkGetPhysicalDeviceImageFormatProperties2)
   MOCKTAIL_VK_ALIAS(vkBindBufferMemory2KHR, vkBindBufferMemory2)
   MOCKTAIL_VK_ALIAS(vkCmdCopyImage2KHR, vkCmdCopyImage2)
+  if(Fsr3InputsAvailable()) {
+    MOCKTAIL_VK_ALIAS(vkCmdDrawIndirectCountKHR,vkCmdDrawIndirectCount)
+    MOCKTAIL_VK_ALIAS(vkCmdDrawIndexedIndirectCountKHR,vkCmdDrawIndexedIndirectCount)
+    MOCKTAIL_VK_ALIAS(vkCmdDrawIndirectCountAMD,vkCmdDrawIndirectCount)
+    MOCKTAIL_VK_ALIAS(vkCmdDrawIndexedIndirectCountAMD,vkCmdDrawIndexedIndirectCount)
+  }
   MOCKTAIL_VK_ALIAS(vkMapMemory2KHR, vkMapMemory2)
   MOCKTAIL_VK_ALIAS(vkUnmapMemory2KHR, vkUnmapMemory2)
   MOCKTAIL_VK_ALIAS(vkCmdCopyBufferToImage2KHR, vkCmdCopyBufferToImage2)
@@ -1181,7 +1284,21 @@ bool IsDeviceAdapterProc(const char* name) {
           std::strcmp(name, "vkDestroyFramebuffer") == 0 ||
           std::strcmp(name, "vkCreateRenderPass") == 0 ||
           std::strcmp(name, "vkDestroyRenderPass") == 0 ||
-          std::strcmp(name, "vkCmdBeginRenderPass") == 0);
+          std::strcmp(name, "vkCmdBeginRenderPass") == 0 ||
+          (Fsr3InputsAvailable() && std::strcmp(name,"vkCmdBindPipeline")==0) ||
+          (Fsr3InputsAvailable() && (std::strcmp(name,"vkCmdDraw")==0 ||
+              std::strcmp(name,"vkCmdDrawIndexed")==0 ||
+              std::strcmp(name,"vkCmdDrawIndirect")==0 ||
+              std::strcmp(name,"vkCmdDrawIndexedIndirect")==0 ||
+              std::strcmp(name,"vkCmdDrawIndirectCount")==0 ||
+              std::strcmp(name,"vkCmdDrawIndexedIndirectCount")==0 ||
+              std::strcmp(name,"vkCmdDrawIndirectCountKHR")==0 ||
+              std::strcmp(name,"vkCmdDrawIndexedIndirectCountKHR")==0 ||
+              std::strcmp(name,"vkCmdDrawIndirectCountAMD")==0 ||
+              std::strcmp(name,"vkCmdDrawIndexedIndirectCountAMD")==0)) ||
+          (Fsr3InputsAvailable() && (std::strcmp(name,"vkDestroyPipeline")==0 ||
+              std::strcmp(name,"vkDestroyShaderModule")==0)) ||
+          ((FovTraceEnabled() || Fsr3InputsAvailable()) && std::strcmp(name, "vkCmdEndRenderPass") == 0));
 }
 
 bool IsGlobalAdapterProc(const char* name) {
@@ -1557,6 +1674,7 @@ VkResult VKAPI_CALL ProfiledCreateGraphicsPipelines(
                                        "pipeline");
   const VkResult result =
       host(device, cache, count, infos, allocator, pipelines);
+  if(result==VK_SUCCESS)Fsr3DumpGraphicsPipelines(device,count,infos,pipelines);
   scope.Arg("count", count);
   scope.Arg("cache", cache != VK_NULL_HANDLE);
   scope.Arg("result", result);
@@ -1594,6 +1712,7 @@ VkResult VKAPI_CALL ProfiledCreateShaderModule(
   mocktail::graphics::TraceScope scope(mocktail::graphics::ActiveProfileTrace(),
                                        "vkCreateShaderModule", "pipeline");
   const VkResult result = host(device, create_info, allocator, shader_module);
+  if(result==VK_SUCCESS && shader_module)Fsr3DumpShader(device,*shader_module,create_info);
   scope.Arg("bytes", create_info != nullptr
                          ? static_cast<std::int64_t>(create_info->codeSize)
                          : 0);
@@ -1647,9 +1766,12 @@ VkResult VKAPI_CALL ProfiledAllocateMemory(
 // These take precedence over the ETC2 wrappers, so a command both wrap is
 // timed inside its adapter function instead.
 PFN_vkVoidFunction ProfileAdapterProc(const char* name) {
-  if (name == nullptr || mocktail::graphics::ActiveProfileTrace() == nullptr) {
-    return nullptr;
-  }
+  if (name == nullptr) return nullptr;
+  if (std::strcmp(name, "vkCreateShaderModule") == 0 && (Fsr3ShaderDumpEnabled() || Fsr3InputsAvailable()))
+    return reinterpret_cast<PFN_vkVoidFunction>(ProfiledCreateShaderModule);
+  if (std::strcmp(name, "vkCreateGraphicsPipelines") == 0 && (Fsr3ShaderDumpEnabled() || Fsr3InputsAvailable()))
+    return reinterpret_cast<PFN_vkVoidFunction>(ProfiledCreateGraphicsPipelines);
+  if (mocktail::graphics::ActiveProfileTrace() == nullptr) return nullptr;
   if (std::strcmp(name, "vkCreateGraphicsPipelines") == 0) {
     return reinterpret_cast<PFN_vkVoidFunction>(
         ProfiledCreateGraphicsPipelines);
@@ -1705,6 +1827,7 @@ void ReleaseEtc2PoolCommandBuffers(VkDevice device,
   }
   for (VkCommandBuffer command_buffer : command_buffers) {
     State().etc2.ReleaseCommandBuffer(command_buffer);
+    Fsr3ResetCommand(command_buffer);
   }
 }
 
@@ -1838,6 +1961,34 @@ const VkSubmitInfo2* PrepareEtc2Submit2(std::uint32_t submit_count,
   return rewritten_any ? rewrite->rewritten2.data() : submits;
 }
 
+#include "vulkan_foveation_adapter.inc"
+#include "vulkan_temporal_inputs_adapter.inc"
+
+using DesktopQueueNormalizer = VkImageLayout (*)(VkCommandBuffer, VkImage,
+    unsigned*, unsigned*, VkImageLayout*, VkImageLayout);
+DesktopQueueNormalizer DesktopBarrierNormalizer() {
+  static const auto normalize = ResolveProcessFunction<DesktopQueueNormalizer>(
+      "mocktail_vr_xr_desktop_barrier");
+  return normalize;
+}
+
+template <class Barrier>
+static void NormalizeDesktopQueueBarriers(VkCommandBuffer command,
+                                           std::uint32_t count,
+                                           Barrier* barriers) {
+  const auto normalize = DesktopBarrierNormalizer();
+  if (!normalize) return;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    auto& image = barriers[i];
+    if (mocktail::graphics::internal::NeedsDesktopQueueNormalization(
+            image.srcQueueFamilyIndex, image.dstQueueFamilyIndex))
+      image.newLayout = normalize(command, image.image,
+          &image.srcQueueFamilyIndex, &image.dstQueueFamilyIndex,
+          &image.oldLayout, image.newLayout);
+  }
+}
+
+
 }  // namespace
 
 extern "C" {
@@ -1933,11 +2084,11 @@ vkCreateInstance(const VkInstanceCreateInfo* create_info,
 
 VKAPI_ATTR void VKAPI_CALL
 vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* allocator) {
-  const auto note = ResolveProcessFunction<void (*)(VkInstance)>(
+  const auto note = ResolveProcessFunction<bool (*)(VkInstance)>(
       "mocktail_vr_xr_note_instance_destroyed");
-  if (note != nullptr) note(instance);
+  const bool retained_by_backend = note != nullptr && note(instance);
 
-  const auto host_destroy = reinterpret_cast<PFN_vkDestroyInstance>(
+  const auto host_destroy = retained_by_backend ? nullptr : reinterpret_cast<PFN_vkDestroyInstance>(
       HostInstanceProc(instance, "vkDestroyInstance"));
   if (host_destroy != nullptr) {
     host_destroy(instance, allocator);
@@ -2200,6 +2351,32 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     }
   }
 
+  // Opt-in shader-work counters for real guest render passes. Preserve the
+  // caller's core feature record after the synchronous device-creation call.
+  bool trace_statistics=false;
+  auto* statistics_features2=const_cast<VkPhysicalDeviceFeatures2*>(
+      reinterpret_cast<const VkPhysicalDeviceFeatures2*>(FindFeature(
+          host_info.pNext,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)));
+  const VkBool32 original_statistics=statistics_features2 ?
+      statistics_features2->features.pipelineStatisticsQuery : VK_FALSE;
+  if(FovTraceEnabled()) {
+    VkPhysicalDeviceFeatures supported{};
+    const auto get_features=reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+        HostInstanceProc(instance,"vkGetPhysicalDeviceFeatures"));
+    if(get_features)get_features(physical_device,&supported);
+    trace_statistics=supported.pipelineStatisticsQuery==VK_TRUE;
+    if(trace_statistics) {
+      if(statistics_features2)statistics_features2->features.pipelineStatisticsQuery=VK_TRUE;
+      else {
+        if(host_info.pEnabledFeatures)host_enabled_features=*host_info.pEnabledFeatures;
+        host_enabled_features.pipelineStatisticsQuery=VK_TRUE;
+        host_info.pEnabledFeatures=&host_enabled_features;
+      }
+    }
+    std::fprintf(stderr,"  [vr-pass-gpu] fragment shader counters %s\n",trace_statistics?"enabled":"unsupported");
+  }
+  const auto foveation_policy =
+      mocktail::graphics::internal::SnapshotFoveationDevicePolicy(&host_info);
   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
   bool vr_handled = false;
   const auto vr_create_device =
@@ -2214,6 +2391,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   if (!vr_handled) {
     result = host_create(physical_device, &host_info, allocator, device);
   }
+  if(trace_statistics && statistics_features2)statistics_features2->features.pipelineStatisticsQuery=original_statistics;
   if (requested_features2 != nullptr) {
     requested_features2->features.textureCompressionETC2 =
         requested_features2_etc2;
@@ -2266,6 +2444,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     break;
   }
 
+  FovRegisterDevice(*device, physical_device, memory_properties, graphics_family, trace_statistics, foveation_policy);
+
   const bool registered =
       enabled.placebo_required && graphics_family != UINT32_MAX &&
       State().text_overlay.RegisterDevice(
@@ -2292,14 +2472,15 @@ vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* allocator) {
       HostDeviceProc(device, "vkDestroyDevice"));
   const auto vr_note_device_destroyed =
       State().vr_note_device_destroyed.load(std::memory_order_acquire);
-  if (vr_note_device_destroyed != nullptr) {
-    // Runs while the device is still valid so the XR backend can destroy
-    // its session and swapchain resources first.
-    vr_note_device_destroyed(device);
-  }
+  // Guest helper resources must always be released, even when the native
+  // device stays alive for the next renderer and the existing XR session.
+  Fsr3ForgetDevice(device);
+  FovDestroyDevice(device);
+  const bool retained = vr_note_device_destroyed != nullptr &&
+                        vr_note_device_destroyed(device);
   State().text_overlay.DestroyDevice(device);
   State().etc2.DestroyDevice(device);
-  if (host_destroy != nullptr) {
+  if (!retained && host_destroy != nullptr) {
     host_destroy(device, allocator);
   }
   RemoveHostDeviceDispatch(device);
@@ -2677,6 +2858,7 @@ VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
   if (command_buffers != nullptr) {
     for (std::uint32_t index = 0; index < command_buffer_count; ++index) {
       State().etc2.ReleaseCommandBuffer(command_buffers[index]);
+      Fsr3ResetCommand(command_buffers[index]);
     }
   }
   static const auto note = ResolveProcessFunction<void (*)(
@@ -2722,7 +2904,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(
     return VK_ERROR_INITIALIZATION_FAILED;
   }
   State().etc2.ReleaseCommandBuffer(command_buffer);
+    Fsr3ResetCommand(command_buffer);
   const VkResult result = host_begin(command_buffer, begin_info);
+  if(result==VK_SUCCESS)FovTraceReset(command_buffer);
   static const auto note = ResolveProcessFunction<void (*)(VkCommandBuffer)>(
       "mocktail_vr_xr_reset_command");
   if (result == VK_SUCCESS && note)
@@ -2755,6 +2939,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandBuffer(
     return VK_ERROR_INITIALIZATION_FAILED;
   }
   State().etc2.ReleaseCommandBuffer(command_buffer);
+    Fsr3ResetCommand(command_buffer);
   const VkResult result = host_reset(command_buffer, flags);
   static const auto note = ResolveProcessFunction<void (*)(VkCommandBuffer)>(
       "mocktail_vr_xr_reset_command");
@@ -2803,8 +2988,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
       PrepareEtc2Submit(submit_count, submits, &rewrite);
   const VkResult result = State().text_overlay.QueueSubmit(
       queue, submit_count, prepared, fence, LockedHostSubmit);
-  if (result == VK_SUCCESS)
+  if (result == VK_SUCCESS) {
     NoteVrSubmitted(queue, submit_count, prepared);
+    FovTraceSubmitted(queue,submit_count,prepared);
+  }
   observation.SetResult(result);
   return result;
 }
@@ -2827,8 +3014,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
       PrepareEtc2Submit2(submit_count, submits, &rewrite);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, submit_count, prepared, fence, LockedHostSubmit2);
-  if (result == VK_SUCCESS)
+  if (result == VK_SUCCESS) {
     NoteVrSubmitted2(queue, submit_count, prepared);
+    FovTraceSubmitted(queue,submit_count,prepared);
+  }
   observation.SetResult(result);
   return result;
 }
@@ -2851,8 +3040,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
       PrepareEtc2Submit2(submit_count, submits, &rewrite);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, submit_count, prepared, fence, LockedHostSubmit2KHR);
-  if (result == VK_SUCCESS)
+  if (result == VK_SUCCESS) {
     NoteVrSubmitted2(queue, submit_count, prepared);
+    FovTraceSubmitted(queue,submit_count,prepared);
+  }
   observation.SetResult(result);
   return result;
 }
@@ -3218,10 +3409,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(
     const VkAllocationCallbacks* allocator, VkImage* image) {
   mocktail::graphics::TraceScope scope(mocktail::graphics::ActiveProfileTrace(),
                                        "vkCreateImage", "memory");
+  VkImageCreateInfo effective{};
   const VkResult result =
-      State().etc2.CreateImage(device, create_info, allocator, image);
+      Fsr3CreateImage(device, create_info, allocator, image, &effective);
   const auto record = State().vr_record_image.load(std::memory_order_acquire);
   if (result == VK_SUCCESS && record != nullptr && image != nullptr) {
+    // Preserve the guest's original provenance contract. Adding transfer
+    // usage for temporal capture must not make a scene intermediate appear
+    // to the existing backend as a new final-eye target.
     record(device, *image, create_info);
   }
   return result;
@@ -3235,6 +3430,7 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyImage(
   if (note != nullptr && image != VK_NULL_HANDLE) {
     note(image);
   }
+  Fsr3ForgetImage(image);
   State().etc2.DestroyImage(device, image, allocator);
 }
 
@@ -3249,6 +3445,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
       view != nullptr) {
     record(*view, create_info->image);
   }
+  if(result==VK_SUCCESS && view)Fsr3RecordView(*view,create_info);
   return result;
 }
 
@@ -3359,6 +3556,7 @@ vkDestroyImageView(VkDevice device, VkImageView image_view,
   if (note != nullptr && image_view != VK_NULL_HANDLE) {
     note(image_view);
   }
+  Fsr3ForgetView(image_view);
   const PFN_vkDestroyImageView host_destroy =
       HostDispatchForDevice(device).destroy_image_view;
   if (host_destroy != nullptr) {
@@ -3374,18 +3572,21 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateFramebuffer(
   if (host_create == nullptr) {
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  const VkResult result = host_create(device, create_info, allocator, framebuffer);
+  const VkResult result = FovCreateFramebuffer(device, create_info, allocator, framebuffer);
   const auto record =
       State().vr_record_framebuffer.load(std::memory_order_acquire);
   if (result == VK_SUCCESS && record != nullptr) {
     record(*framebuffer, create_info);
   }
+  if(result==VK_SUCCESS && framebuffer)Fsr3RecordFramebuffer(device,*framebuffer,create_info);
   return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer,
                      const VkAllocationCallbacks* allocator) {
+  Fsr3ForgetFramebuffer(framebuffer);
+  FovForgetFramebuffer(device, framebuffer);
   const auto note =
       State().vr_note_destroy_framebuffer.load(std::memory_order_acquire);
   if (note != nullptr && framebuffer != VK_NULL_HANDLE) {
@@ -3406,7 +3607,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(
   if (host_create == nullptr) {
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  const VkResult result = host_create(device, create_info, allocator, render_pass);
+  const VkResult result = Fsr3CreateRenderPass(device, create_info, allocator, render_pass);
+  if(result==VK_SUCCESS && render_pass)Fsr3RecordDiagnosticPass(*render_pass,create_info);
   const auto record =
       State().vr_record_render_pass.load(std::memory_order_acquire);
   if (result == VK_SUCCESS && record != nullptr) {
@@ -3418,6 +3620,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(
 VKAPI_ATTR void VKAPI_CALL
 vkDestroyRenderPass(VkDevice device, VkRenderPass render_pass,
                     const VkAllocationCallbacks* allocator) {
+  Fsr3ForgetPass(render_pass);
+  FovForgetRenderPass(render_pass);
   const PFN_vkDestroyRenderPass host_destroy =
       HostDispatchForDevice(device).destroy_render_pass;
   if (host_destroy != nullptr) {
@@ -3437,8 +3641,78 @@ vkCmdBeginRenderPass(VkCommandBuffer command_buffer,
   const PFN_vkCmdBeginRenderPass host_begin =
       HostDispatchForCommandBuffer(command_buffer).cmd_begin_render_pass;
   if (host_begin != nullptr) {
-    host_begin(command_buffer, begin_info, contents);
+    if (begin_info) {
+      auto adjusted = *begin_info;
+      adjusted.framebuffer = FovFramebufferForBegin(HostDispatchForCommandBuffer(command_buffer).device, begin_info);
+      FovTraceBegin(command_buffer,HostDispatchForCommandBuffer(command_buffer).device,begin_info,adjusted.framebuffer!=begin_info->framebuffer,contents==VK_SUBPASS_CONTENTS_INLINE);
+      Fsr3SceneBegin(HostDispatchForCommandBuffer(command_buffer).device,command_buffer,begin_info,contents);
+      adjusted.renderPass=Fsr3RenderPassForBegin(HostDispatchForCommandBuffer(command_buffer).device,begin_info->renderPass);
+      host_begin(command_buffer, &adjusted, contents);
+      FovTraceDrawScope(command_buffer,HostDispatchForCommandBuffer(command_buffer).device,true);
+    } else {
+      host_begin(command_buffer, begin_info, contents);
+    }
   }
+}
+
+
+
+VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer command,uint32_t vertex_count,
+    uint32_t instance_count,uint32_t first_vertex,uint32_t first_instance) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw;
+  if(host){Fsr3NoteDraw(command);host(command,vertex_count,instance_count,first_vertex,first_instance);}
+}
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer command,uint32_t count,
+    uint32_t instances,uint32_t first,int32_t offset,uint32_t first_instance) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw_indexed;
+  if(host){Fsr3NoteDraw(command);host(command,count,instances,first,offset,first_instance);}
+}
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer command,VkBuffer buffer,
+    VkDeviceSize offset,uint32_t count,uint32_t stride) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw_indirect;
+  if(host){Fsr3NoteDraw(command);host(command,buffer,offset,count,stride);}
+}
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer command,VkBuffer buffer,
+    VkDeviceSize offset,uint32_t count,uint32_t stride) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw_indexed_indirect;
+  if(host){Fsr3NoteDraw(command);host(command,buffer,offset,count,stride);}
+}
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer command,VkBuffer buffer,
+    VkDeviceSize offset,VkBuffer count_buffer,VkDeviceSize count_offset,uint32_t max_count,uint32_t stride) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw_indirect_count;
+  if(host){Fsr3NoteDraw(command);host(command,buffer,offset,count_buffer,count_offset,max_count,stride);}
+}
+VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer command,VkBuffer buffer,
+    VkDeviceSize offset,VkBuffer count_buffer,VkDeviceSize count_offset,uint32_t max_count,uint32_t stride) {
+  const auto host=HostDispatchForCommandBuffer(command).cmd_draw_indexed_indirect_count;
+  if(host){Fsr3NoteDraw(command);host(command,buffer,offset,count_buffer,count_offset,max_count,stride);}
+}
+
+VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer command,
+    VkPipelineBindPoint point,VkPipeline pipeline) {
+  const auto& dispatch=HostDispatchForCommandBuffer(command);
+  const auto host=dispatch.cmd_bind_pipeline;
+  if(host){host(command,point,pipeline);Fsr3NotePipeline(dispatch.device,command,point,pipeline);}
+}
+VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice device,VkPipeline pipeline,
+    const VkAllocationCallbacks* allocator) {
+  Fsr3ForgetPipeline(pipeline);
+  const auto host=HostDispatchForDevice(device).destroy_pipeline;
+  if(host)host(device,pipeline,allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice device,VkShaderModule shader,
+    const VkAllocationCallbacks* allocator) {
+  Fsr3ForgetShader(shader);
+  const auto destroy=HostDispatchForDevice(device).destroy_shader_module;
+  if(destroy)destroy(device,shader,allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer command_buffer) {
+  const auto& dispatch=HostDispatchForCommandBuffer(command_buffer);
+  const auto device=dispatch.device;
+  const auto end=dispatch.cmd_end_render_pass;
+  if(end) {FovTraceDrawScope(command_buffer,device,false);end(command_buffer);Fsr3SceneEnd(device,command_buffer);FovTraceEnd(command_buffer,device);}
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
@@ -3457,63 +3731,73 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
   return result;
 }
 
+
 VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(
     VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst,
     VkDependencyFlags flags, uint32_t memory_count,
     const VkMemoryBarrier *memory, uint32_t buffer_count,
     const VkBufferMemoryBarrier *buffers, uint32_t image_count,
     const VkImageMemoryBarrier *images) {
-  const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
-      HostDeviceProc(HostDispatchForCommandBuffer(command).device,
-                     "vkCmdPipelineBarrier"));
-  if (!barrier)
+  const auto barrier = HostDispatchForCommandBuffer(command).cmd_pipeline_barrier;
+  if (!barrier) return;
+  static const auto normalize_batch = ResolveProcessFunction<void (*)(
+      VkCommandBuffer, unsigned, VkImageMemoryBarrier*)>(
+      "mocktail_vr_xr_desktop_barriers");
+  if (!normalize_batch && !DesktopBarrierNormalizer()) {
+    barrier(command, src, dst, flags, memory_count, memory, buffer_count,
+            buffers, image_count, images);
     return;
-  static const auto normalize = ResolveProcessFunction<VkImageLayout (*)(
-      VkCommandBuffer, VkImage, unsigned *, unsigned *, VkImageLayout *,
-      VkImageLayout)>("mocktail_vr_xr_desktop_barrier");
-  std::vector<VkImageMemoryBarrier> adjusted;
-  if (normalize && images && image_count) {
-    adjusted.assign(images, images + image_count);
-    for (auto &image : adjusted)
-      image.newLayout = normalize(
-          command, image.image, &image.srcQueueFamilyIndex,
-          &image.dstQueueFamilyIndex, &image.oldLayout, image.newLayout);
-    images = adjusted.data();
   }
-  barrier(command, src, dst, flags, memory_count, memory, buffer_count, buffers,
-          image_count, images);
+  mocktail::graphics::internal::WithDesktopQueueBarriers(image_count, images,
+      [&](unsigned count, VkImageMemoryBarrier* adjusted) {
+        if (normalize_batch) normalize_batch(command, count, adjusted);
+        else NormalizeDesktopQueueBarriers(command, count, adjusted);
+      }, [&](const VkImageMemoryBarrier* adjusted) {
+        barrier(command, src, dst, flags, memory_count, memory, buffer_count,
+                buffers, image_count, adjusted);
+      });
 }
 
 static void ForwardVrBarrier2(VkCommandBuffer command,
-                              const VkDependencyInfo *info, const char *name) {
-  const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
-      HostDeviceProc(HostDispatchForCommandBuffer(command).device, name));
-  if (!barrier || !info)
+                              const VkDependencyInfo *info,
+                              PFN_vkCmdPipelineBarrier2 barrier) {
+  if (!barrier || !info) return;
+  static const auto normalize_batch = ResolveProcessFunction<void (*)(
+      VkCommandBuffer, unsigned, VkImageMemoryBarrier2*)>(
+      "mocktail_vr_xr_desktop_barriers2");
+  if (!normalize_batch && !DesktopBarrierNormalizer()) {
+    barrier(command, info);
     return;
-  static const auto normalize = ResolveProcessFunction<VkImageLayout (*)(
-      VkCommandBuffer, VkImage, unsigned *, unsigned *, VkImageLayout *,
-      VkImageLayout)>("mocktail_vr_xr_desktop_barrier");
-  VkDependencyInfo adjusted_info = *info;
-  std::vector<VkImageMemoryBarrier2> adjusted;
-  if (normalize && info->pImageMemoryBarriers &&
-      info->imageMemoryBarrierCount) {
-    adjusted.assign(info->pImageMemoryBarriers,
-                    info->pImageMemoryBarriers + info->imageMemoryBarrierCount);
-    for (auto &image : adjusted)
-      image.newLayout = normalize(
-          command, image.image, &image.srcQueueFamilyIndex,
-          &image.dstQueueFamilyIndex, &image.oldLayout, image.newLayout);
-    adjusted_info.pImageMemoryBarriers = adjusted.data();
   }
-  barrier(command, &adjusted_info);
+  mocktail::graphics::internal::WithDesktopQueueBarriers(
+      info->imageMemoryBarrierCount, info->pImageMemoryBarriers,
+      [&](unsigned count, VkImageMemoryBarrier2* adjusted) {
+        if (normalize_batch) normalize_batch(command, count, adjusted);
+        else NormalizeDesktopQueueBarriers(command, count, adjusted);
+      }, [&](const VkImageMemoryBarrier2* adjusted) {
+        if (adjusted == info->pImageMemoryBarriers) barrier(command, info);
+        else {
+          auto adjusted_info = *info;
+          adjusted_info.pImageMemoryBarriers = adjusted;
+          barrier(command, &adjusted_info);
+        }
+      });
 }
 VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer command,
                                                  const VkDependencyInfo *info) {
-  ForwardVrBarrier2(command, info, "vkCmdPipelineBarrier2");
+  ForwardVrBarrier2(command, info,
+      HostDispatchForCommandBuffer(command).cmd_pipeline_barrier2);
 }
 VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2KHR(
     VkCommandBuffer command, const VkDependencyInfo *info) {
-  ForwardVrBarrier2(command, info, "vkCmdPipelineBarrier2KHR");
+  ForwardVrBarrier2(command, info,
+      HostDispatchForCommandBuffer(command).cmd_pipeline_barrier2_khr);
+}
+
+VKAPI_ATTR std::int32_t mocktail_vulkan_run_queue_synchronized(
+    VkDevice device, VkQueue queue, std::int32_t (*operation)(void *), void *context) {
+  const QueueCallGuard guard(device, queue);
+  return operation(context);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mocktail_vulkan_submit_synchronized(
@@ -3534,4 +3818,3 @@ mocktail_vulkan_idle_synchronized(PFN_vkDeviceWaitIdle raw, VkDevice device) {
 }
 
 } // extern "C"
-

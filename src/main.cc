@@ -905,6 +905,11 @@ int main(int argc, char* argv[]) {
                      "(MOCKTAIL_VR_BACKEND=native).\n";
       }
     }
+#ifdef MOCKTAIL_ENABLE_FSR3
+    constexpr bool preserve_temporal_depth = true;
+#else
+    constexpr bool preserve_temporal_depth = false;
+#endif
     const std::filesystem::path fflags_path =
         paths.config_root() / "fflags.json";
     const auto fflags = mocktail::services::LoadAndMergeFflagsFile(
@@ -946,7 +951,7 @@ int main(int argc, char* argv[]) {
     }
     if (!mocktail::runtime::MergeVrClientSettingsOverrides(
             vr_active, audio_capture_overrides,
-            &audio_capture_overrides, &command_line_error)) {
+            &audio_capture_overrides, &command_line_error, preserve_temporal_depth)) {
       std::cerr << "[FATAL] Cannot apply VR policy: " << command_line_error << '\n';
       return EXIT_FAILURE;
     }
@@ -967,7 +972,7 @@ int main(int argc, char* argv[]) {
     }
     if (!mocktail::runtime::MergeVrClientSettingsOverrides(
             vr_active, fast_flags_overrides,
-            &fast_flags_overrides, &command_line_error)) {
+            &fast_flags_overrides, &command_line_error, preserve_temporal_depth)) {
       std::cerr << "[FATAL] Cannot apply VR policy: " << command_line_error << '\n';
       return EXIT_FAILURE;
     }
@@ -1219,6 +1224,8 @@ int main(int argc, char* argv[]) {
       std::cout
           << "  [auth] explicit guest identity selected for production VM\n";
     }
+    const bool user_disabled_luau_codegen_switch =
+        environment.GetOr("MOCKTAIL_LUAU_CODEGEN_MENU_SWITCH", "") == "0";
     unsetenv("MOCKTAIL_LUAU_CODEGEN_MENU_SWITCH");
     if (runtime_config.config.desktop_playability()) {
       std::filesystem::path assets = paths.DefaultAssetPath();
@@ -1247,9 +1254,16 @@ int main(int argc, char* argv[]) {
       const bool user_set_luau_codegen =
           mocktail::runtime::ClientSettingsSetLuauCodegenAll(
               user_client_settings);
+      bool default_codegen_at_startup = !user_disabled_luau_codegen_switch;
+#if defined(__aarch64__)
+      // The ARM client must prove a safe menus-only flag before enabling it.
+      default_codegen_at_startup =
+          default_codegen_at_startup && !runtime_config.config.vr_enabled();
+#endif
       if (!mocktail::runtime::MergeDesktopAppPolicyClientSettingsOverride(
               desktop_policy.policy_json, user_client_settings,
-              &desktop_client_settings, &command_line_error)) {
+              &desktop_client_settings, &command_line_error,
+              default_codegen_at_startup)) {
         std::cerr << "[FATAL] Cannot activate desktop Roblox app-policy: "
                   << command_line_error << '\n';
         return EXIT_FAILURE;
@@ -1260,7 +1274,8 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
       }
       setenv("MOCKTAIL_LUAU_CODEGEN_MENU_SWITCH",
-             user_set_luau_codegen ? "0" : "1", 1);
+             (user_set_luau_codegen || user_disabled_luau_codegen_switch)
+                 ? "0" : "1", 1);
       std::cout << "  [runtime] desktop app-policy ready: normalized="
                 << desktop_policy.normalized_policy_count
                 << " updated=" << (desktop_policy.updated ? 1 : 0)

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -285,7 +286,10 @@ bool IsDisabledEnv(const char* name) {
 }
 
 bool WindowStatePersistenceSuppressed() {
-  return IsEnabledEnv("MOCKTAIL_RESIZE_READINESS") ||
+  // A hidden VR surface supplies Roblox's logical UI viewport. Restoring a
+  // tiny desktop window here magnifies in-game panels despite unchanged eyes.
+  return IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW") ||
+         IsEnabledEnv("MOCKTAIL_RESIZE_READINESS") ||
          IsEnabledEnv("MOCKTAIL_FULLSCREEN_READINESS") ||
          IsEnabledEnv("MOCKTAIL_INPUT_READINESS") ||
          IsEnabledEnv("MOCKTAIL_AUTO_EXIT_AFTER_PRESENT_MS");
@@ -1179,7 +1183,9 @@ bool Init(int width, int height, const char* title) {
     // SDL_SyncWindow can time out there while waiting for an unrelated WM
     // state request (notably restored maximization) even though the native
     // window is already valid for Vulkan WSI.
-    if (!SDL_ShowWindow(g_state.sdl_window)) {
+    const char* mirror_driver = SDL_GetCurrentVideoDriver();
+    const bool hidden_vr_window = IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW") && mirror_driver && StringEquals(mirror_driver,"x11");
+    if (!hidden_vr_window && !SDL_ShowWindow(g_state.sdl_window)) {
       fprintf(stderr, "  [window] SDL_ShowWindow failed: %s\n", SDL_GetError());
       SDL_DestroyWindow(g_state.sdl_window);
       g_state.sdl_window = nullptr;
@@ -1205,9 +1211,10 @@ bool Init(int width, int height, const char* title) {
     int pixel_width = 0;
     int pixel_height = 0;
     SDL_GetWindowSizeInPixels(g_state.sdl_window, &pixel_width, &pixel_height);
-    g_state.visible = true;
+    g_state.visible = !hidden_vr_window;
+    if(hidden_vr_window) fprintf(stderr,"  [window] VR-only X11 rendering surface stays hidden; no desktop mirror window\n");
     fprintf(stderr,
-            "  [window] direct Vulkan window mapped for WSI configure "
+            "  [window] direct Vulkan WSI surface ready "
             "(%dx%d pixels)\n",
             pixel_width, pixel_height);
     fprintf(stderr, "  [window] SDL3 direct Vulkan window created (%dx%d)\n",
@@ -1614,6 +1621,15 @@ WindowViewportSnapshot GetWindowViewportSnapshot() {
 
 platform::DisplayRefreshCapabilities GetDisplayRefreshCapabilities() {
   platform::DisplayRefreshCapabilities caps = g_state.display_refresh;
+  // The hidden desktop can have a different refresh rate. VR must report the
+  // active HMD rate to Android/Roblox even when desktop presentation is uncapped.
+  const char* vr_enabled=std::getenv("MOCKTAIL_VR_ENABLED");
+  const char* hmd_hz=std::getenv("MOCKTAIL_VR_DISPLAY_HZ");
+  if(vr_enabled && std::strcmp(vr_enabled,"1")==0 && hmd_hz) {
+    char* end=nullptr;const float hz=std::strtof(hmd_hz,&end);
+    if(end && *end=='\0' && std::isfinite(hz) && hz>=30.f && hz<=240.f)
+      return platform::NormalizeDisplayRefreshCapabilities(hz,{hz});
+  }
   if (!UnthrottledPresentationRequested() || !caps.valid()) {
     return caps;
   }
@@ -1726,6 +1742,7 @@ void* GetGLProcAddress(const char* name) {
 }
 
 void ShowIfHidden() {
+  if(IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW")) return;
   if (!g_state.initialised || !g_state.sdl_window || g_state.visible ||
       IsDisabledEnv("MOCKTAIL_SHOW_WINDOW_ON_FIRST_SWAP")) {
     return;
@@ -1735,6 +1752,7 @@ void ShowIfHidden() {
 
 // Main thread only. Shows the window once a frame has asked for it.
 void ApplyShowWindowRequest() {
+  if(IsEnabledEnv("MOCKTAIL_VR_HIDE_DESKTOP_WINDOW")) return;
   if (!g_show_window_requested.load(std::memory_order_acquire) ||
       g_state.sdl_window == nullptr) {
     return;  // Without a window the request stays for the next pump.

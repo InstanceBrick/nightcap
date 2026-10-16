@@ -13,7 +13,6 @@ body:
 
         Use any language you are comfortable with.
 
-        Please write issues and pull requests yourself.
 
   - type: textarea
     id: problem

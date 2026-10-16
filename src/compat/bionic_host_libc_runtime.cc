@@ -1,4 +1,6 @@
 #include "compat/bionic_host_libc_runtime.h"
+#include "compat/allocator_snapshot_cache.h"
+#include <chrono>
 
 #include <fcntl.h>
 #include <limits.h>
@@ -245,10 +247,14 @@ void BionicArc4RandomBuffer(void* buffer, size_t size) noexcept {
 BionicMallinfoSnapshot BionicMallinfo() noexcept {
 #if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 33)
-  const struct mallinfo2 host = ::mallinfo2();
-  return {host.arena,    host.ordblks, host.smblks,  host.hblks,
-          host.hblkhd,   host.usmblks, host.fsmblks, host.uordblks,
-          host.fordblks, host.keepcost};
+  static AllocatorSnapshotCache cache;
+  const auto now=std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  return cache.Read(static_cast<std::uint64_t>(now),[]() noexcept {
+    const struct mallinfo2 host=::mallinfo2();
+    return BionicMallinfoSnapshot{host.arena,host.ordblks,host.smblks,host.hblks,
+        host.hblkhd,host.usmblks,host.fsmblks,host.uordblks,host.fordblks,host.keepcost};
+  });
 #endif
 #endif
   return {};

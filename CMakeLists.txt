@@ -820,3 +820,17 @@ add_dependencies(mocktail mocktail_webview_helper)
 if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
+
+# Native SteamVR identity/settings helper; a background client never takes scene focus.
+add_executable(nightcap-vr-settings tools/frame_video_settings/nightcap-vr-settings.cc)
+target_include_directories(nightcap-vr-settings PRIVATE tools/frame_video_settings)
+target_link_libraries(nightcap-vr-settings PRIVATE ${CMAKE_DL_LIBS})
+install(TARGETS nightcap-vr-settings RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(MOCKTAIL_ENABLE_VR)
+  add_executable(nightcap-vr-performance tools/frame_video_settings/performance_overlay.cc)
+  target_include_directories(nightcap-vr-performance PRIVATE include tools/frame_video_settings)
+  target_link_libraries(nightcap-vr-performance PRIVATE SDL3::SDL3 SDL3_ttf::SDL3_ttf
+    PkgConfig::FONTCONFIG ${CMAKE_DL_LIBS})
+  install(TARGETS nightcap-vr-performance RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""Desktop entry point for the native ARM64 Nightcap build."""
+from pathlib import Path
+import subprocess
+import sys
+
+work = Path.home() / '.local/share/nightcap-vr-arm64'
+container = 'nightcap-arm64-test'
+check = subprocess.run(['podman', 'inspect', '--format', '{{.State.Running}}', container],
+                       capture_output=True, text=True)
+if check.returncode == 0:
+    if check.stdout.strip() == 'true':
+        subprocess.run(['notify-send', 'Nightcap Roblox VR', 'Nightcap VR is already running.'],
+                       check=False)
+        sys.exit(0)
+    subprocess.run(['podman', 'rm', container], check=True, stdout=subprocess.DEVNULL)
+work.mkdir(parents=True, exist_ok=True)
+with (work / 'last-launch.log').open('w') as log:
+    result = subprocess.run(['/usr/bin/python3', str(work / 'run-nightcap-arm64.py'), *sys.argv[1:]],
+                            stdout=log, stderr=subprocess.STDOUT)
+if result.returncode:
+    subprocess.run(['notify-send', 'Nightcap Roblox VR', 'Launch failed. See ~/.local/share/nightcap-vr-arm64/last-launch.log'],
+                   check=False)
+sys.exit(result.returncode)

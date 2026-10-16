@@ -16,6 +16,7 @@ void OpenXrBackend::StopControllerHaptics(int) {}
 OpenXrBackend* ActiveVrBackend() { return nullptr; }
 void OpenXrBackend::NotePoseApplied(void*, std::uint64_t) {}
 ScriptedPoseSample OpenXrBackend::PublishedHeadPose() const { return {}; }
+bool OpenXrBackend::UpdateEyeResolution() { return false; }
 bool OpenXrBackend::RecommendedEyeExtent(std::uint32_t*, std::uint32_t*) const {
   return false;
 }

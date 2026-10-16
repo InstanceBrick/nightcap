@@ -2,3 +2,7 @@
 # snapshot. Local Mocktail sources remain subject to git diff --check.
 third_party/mcpelauncher-linker/core/** -whitespace
 packaging/freebsd/*.patch -whitespace
+
+# Preserve original third-party shader/header whitespace.
+src/vr/smaa/** -whitespace
+tools/frame_video_settings/openvr.h -whitespace

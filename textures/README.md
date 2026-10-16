@@ -8,8 +8,8 @@ installed or loaded automatically.
 Copy the file into the override directory, keeping its name:
 
 ```sh
-mkdir -p ~/.config/mocktail/textures
-cp textures/75dcd1166a6cbaa9.png ~/.config/mocktail/textures/
+mkdir -p ~/.local/share/nightcap-vr-arm64/data/.config/mocktail/textures
+cp textures/75dcd1166a6cbaa9.png ~/.local/share/nightcap-vr-arm64/data/.config/mocktail/textures/
 ```
 
 Restart the game. The log line `[vulkan] texture override loaded: <path>`

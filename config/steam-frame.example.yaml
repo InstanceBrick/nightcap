@@ -1,0 +1,19 @@
+version: 1
+device: pc-windows-11
+
+graphics:
+  backend: direct-vulkan
+  vsync: off
+
+vr:
+  enabled: true
+  frame_rate_limit: unlimited
+
+audio:
+  output_device: default
+  input_device: default
+
+updates:
+  automatic: false
+  launch_after_update: false
+  source: auto
